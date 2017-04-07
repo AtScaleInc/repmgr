@@ -7473,7 +7473,61 @@ create_schema(PGconn *conn)
 	res = PQexec(conn, sqlquery);
 	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
-		log_err(_("unable to create the function repmgr_get_last_updated: %s\n"),
+		log_err(_("unable to create the function repmgr_get_last_updated(): %s\n"),
+				PQerrorMessage(conn));
+
+		if (res != NULL)
+			PQclear(res);
+
+		return false;
+	}
+	PQclear(res);
+
+	sqlquery_snprintf(sqlquery,
+					  "CREATE OR REPLACE FUNCTION %s.repmgr_validate_type() "
+					  "  RETURNS TRIGGER "
+					  "  LANGUAGE plpgsql "
+					  "AS $$ "
+					  "  DECLARE "
+					  "    v_rowcount INT; "
+					  "  BEGIN "
+					  "    IF NEW.type = 'bdr' THEN "
+					  " "
+					  "      SELECT INTO v_rowcount "
+					  "             COUNT(*) "
+					  "        FROM %s.repl_nodes "
+					  "       WHERE type != 'bdr'; "
+					  " "
+					  "      IF v_rowcount > 0 THEN "
+					  "        RAISE EXCEPTION 'A BDR node cannot be added to a physical replication cluster'; "
+					  "        RETURN NULL; "
+					  "      END IF; "
+					  " "
+					  "    ELSE "
+					  " "
+					  "      SELECT INTO v_rowcount "
+					  "             COUNT(*) "
+					  "        FROM %s.repl_nodes "
+					  "       WHERE type NOT IN ('master','standby','witness'); "
+					  " "
+					  "      IF v_rowcount > 0 THEN "
+					  "        RAISE EXCEPTION 'A physical replication node cannot be added to a BDR cluster'; "
+ 					  "       RETURN NULL; "
+					  "      END IF; "
+					  " "
+					  "    END IF; "
+					  " "
+					  "    RETURN NEW; "
+					  "  END; "
+					  "$$",
+					  get_repmgr_schema_quoted(conn),
+					  get_repmgr_schema_quoted(conn),
+					  get_repmgr_schema_quoted(conn));
+
+	res = PQexec(conn, sqlquery);
+	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		log_err(_("unable to create the function rrepmgr_validate_type(): %s\n"),
 				PQerrorMessage(conn));
 
 		if (res != NULL)
@@ -7484,13 +7538,13 @@ create_schema(PGconn *conn)
 	PQclear(res);
 
 
-	/* Create tables */
+	/* Create tables and associated triggers */
 
 	/* CREATE TABLE repl_nodes */
 	sqlquery_snprintf(sqlquery,
 					  "CREATE TABLE %s.repl_nodes (     "
 					  "  id               INTEGER PRIMARY KEY, "
-					  "  type             TEXT    NOT NULL CHECK (type IN('master','standby','witness')), "
+					  "  type             TEXT    NOT NULL CHECK (type IN('master','standby','witness','bdr')), "
 					  "  upstream_node_id INTEGER NULL REFERENCES %s.repl_nodes (id) DEFERRABLE, "
 					  "  cluster          TEXT    NOT NULL, "
 					  "  name             TEXT    NOT NULL, "
@@ -7506,6 +7560,28 @@ create_schema(PGconn *conn)
 	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
 		log_err(_("unable to create table '%s.repl_nodes': %s\n"),
+				get_repmgr_schema_quoted(conn), PQerrorMessage(conn));
+
+		if (res != NULL)
+			PQclear(res);
+
+		return false;
+	}
+	PQclear(res);
+
+	/* CREATE TRIGGER repmgr_repl_nodes_type_check_trg */
+	sqlquery_snprintf(sqlquery,
+					  "CREATE TRIGGER repmgr_repl_nodes_type_check_trg "
+					  "  BEFORE INSERT OR UPDATE "
+					  "  ON %s.repl_nodes "
+ 					  " FOR EACH ROW "
+ 					  " EXECUTE PROCEDURE %s.repmgr_validate_type() ",
+					  get_repmgr_schema_quoted(conn),
+					  get_repmgr_schema_quoted(conn));
+	res = PQexec(conn, sqlquery);
+	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		log_err(_("unable to create trigger 'repmgr_repl_nodes_type_check_trg' on '%s.repl_nodes': %s\n"),
 				get_repmgr_schema_quoted(conn), PQerrorMessage(conn));
 
 		if (res != NULL)

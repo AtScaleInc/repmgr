@@ -225,6 +225,7 @@ _parse_config(t_configuration_options *options, ItemList *error_list)
 	 * to be initialised here
 	 */
 	memset(options->cluster_name, 0, sizeof(options->cluster_name));
+	options->replication_type = REPLICATION_TYPE_PHYSICAL;
 	options->node = UNKNOWN_NODE_ID;
 	options->upstream_node = NO_UPSTREAM_NODE;
 	options->use_replication_slots = 0;
@@ -319,6 +320,15 @@ _parse_config(t_configuration_options *options, ItemList *error_list)
 		/* Copy into correct entry in parameters struct */
 		if (strcmp(name, "cluster") == 0)
 			strncpy(options->cluster_name, value, MAXLEN);
+		else if (strcmp(name, "replication_type") == 0)
+		{
+			if (strcmp(value, "physical") == 0)
+				options->replication_type = REPLICATION_TYPE_PHYSICAL;
+			else if (strcmp(value, "bdr") == 0)
+				options->replication_type = REPLICATION_TYPE_BDR;
+			else
+				item_list_append(error_list, _("value for 'replication_type' must be 'physical' or 'bdr'\n"));
+		}
 		else if (strcmp(name, "node") == 0)
 		{
 			options->node = repmgr_atoi(value, "node", error_list, false);
