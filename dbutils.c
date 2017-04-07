@@ -1984,15 +1984,12 @@ _get_node_record(PGconn *conn, char *cluster, char *sqlquery, t_node_info *node_
 }
 
 
-
-
-
 int
 get_node_replication_state(PGconn *conn, char *node_name, char *output)
 {
 	char		sqlquery[QUERY_STR_LEN];
 	PGresult *	res;
-
+	
 	sqlquery_snprintf(
 		sqlquery,
 		" SELECT state "
@@ -2068,4 +2065,27 @@ get_data_checksum_version(const char *data_directory)
 	close(fd);
 
 	return (int)control_file.data_checksum_version;
+}
+
+
+bool
+is_bdr_db(PGconn *conn)
+{
+	char		sqlquery[QUERY_STR_LEN];
+	PGresult *	res;
+
+	sqlquery_snprintf(
+		sqlquery,
+		"SELECT COUNT(*) FROM pg_catalog.pg_namespace WHERE nspname='bdr'"
+		);
+
+	res = PQexec(conn, sqlquery);
+
+	if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0)
+	{
+		PQclear(res);
+		return false;
+	}
+
+	return atoi(PQgetvalue(res, 0, 0)) == 1 ? true : false;
 }

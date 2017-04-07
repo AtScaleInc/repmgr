@@ -21,6 +21,9 @@
  * WITNESS REGISTER
  * WITNESS UNREGISTER
  *
+ * BDR REGISTER
+ * BDR UNREGISTER
+ *
  * CLUSTER CROSSCHECK
  * CLUSTER MATRIX
  * CLUSTER SHOW
@@ -92,6 +95,8 @@
 #define CLUSTER_CLEANUP		   14
 #define CLUSTER_MATRIX		   15
 #define CLUSTER_CROSSCHECK	   16
+#define BDR_REGISTER           17
+#define BDR_UNREGISTER         18
 
 static int	test_ssh_connection(char *host, char *remote_user);
 static int  copy_remote_files(char *host, char *remote_user, char *remote_path,
@@ -134,10 +139,14 @@ static void do_witness_create(void);
 static void do_witness_register(PGconn *masterconn);
 static void do_witness_unregister(void);
 
+static void do_bdr_register(void);
+static void do_bdr_unregister(void);
+
 static void do_cluster_show(void);
 static void do_cluster_matrix(void);
 static void do_cluster_crosscheck(void);
 static void do_cluster_cleanup(void);
+
 static void do_check_upstream_config(void);
 static void do_help(void);
 
@@ -667,6 +676,7 @@ main(int argc, char **argv)
 	 *   { MASTER | PRIMARY } REGISTER |
 	 *   STANDBY {REGISTER | UNREGISTER | CLONE [node] | PROMOTE | FOLLOW [node] | SWITCHOVER | REWIND} |
 	 *   WITNESS { CREATE | REGISTER | UNREGISTER } |
+	 *   BDR { REGISTER | UNREGISTER } |
 	 *   CLUSTER { CROSSCHECK | MATRIX | SHOW | CLEANUP}
 	 *
 	 * the node part is optional, if we receive it then we shouldn't have
@@ -680,6 +690,7 @@ main(int argc, char **argv)
 			/* allow PRIMARY as synonym for MASTER */
 			strcasecmp(server_mode, "PRIMARY") != 0 &&
 			strcasecmp(server_mode, "WITNESS") != 0 &&
+			strcasecmp(server_mode, "BDR") != 0 &&
 			strcasecmp(server_mode, "CLUSTER") != 0)
 		{
 			PQExpBufferData unknown_mode;
@@ -736,6 +747,13 @@ main(int argc, char **argv)
 				action = WITNESS_REGISTER;
 			else if (strcasecmp(server_cmd, "UNREGISTER") == 0)
 				action = WITNESS_UNREGISTER;
+		}
+		else if (strcasecmp(server_mode, "BDR") == 0)
+		{
+			if (strcasecmp(server_cmd, "REGISTER") == 0)
+				action = BDR_REGISTER;
+			else if (strcasecmp(server_cmd, "UNREGISTER") == 0)
+				action = BDR_UNREGISTER;
 		}
 	}
 
@@ -999,6 +1017,12 @@ main(int argc, char **argv)
 			break;
 		case WITNESS_UNREGISTER:
 			do_witness_unregister();
+			break;
+		case BDR_REGISTER:
+			do_bdr_register();
+			break;
+		case BDR_UNREGISTER:
+			do_bdr_unregister();
 			break;
 		case CLUSTER_CROSSCHECK:
 			do_cluster_crosscheck();
@@ -6557,6 +6581,37 @@ do_witness_unregister(void)
 			   options.cluster_name, target_node_id, options.conninfo);
 
 	return;
+}
+
+
+static void
+do_bdr_register(void)
+{
+	PGconn	   *conn;
+
+	/* sanity-check configuration for BDR-compatability */
+	if (options.replication_type != REPLICATION_TYPE_BDR)
+	{
+		log_err(_("cannot run BDR REGISTER on a non-BDR node\n"));
+		exit(ERR_BAD_CONFIG);
+	}
+
+	conn = establish_db_connection(options.conninfo, true);
+
+	if (!is_bdr_db(conn))
+	{
+		/* TODO: name database */
+		log_err(_("database is not BDR-enabled\n"));
+		exit(ERR_BAD_CONFIG);
+	}
+
+}
+
+
+static void
+do_bdr_unregister(void)
+{
+	puts("write code here");
 }
 
 

@@ -139,5 +139,6 @@ bool        create_event_record(PGconn *conn, t_configuration_options *options, 
 int		    get_node_replication_state(PGconn *conn, char *node_name, char *output);
 t_server_type parse_node_type(const char *type);
 int			get_data_checksum_version(const char *data_directory);
+bool		is_bdr_db(PGconn *conn);
 #endif
 
