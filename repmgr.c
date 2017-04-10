@@ -7809,6 +7809,28 @@ create_schema(PGconn *conn)
 	}
 	PQclear(res);
 
+
+	/* For BDR replication, add table to 'repmgr' replication set */
+	if (options.replication_type == REPLICATION_TYPE_BDR)
+	{
+		sqlquery_snprintf(sqlquery,
+						  "SELECT bdr.table_set_replication_sets('%s.repl_nodes', '{repmgr}')",
+						  get_repmgr_schema_quoted(conn));
+
+		res = PQexec(conn, sqlquery);
+		if (!res || PQresultStatus(res) != PGRES_TUPLES_OK)
+		{
+			log_err(_("unable to add table '%s.repl_nodes' to replication set 'repmgr': %s\n"),
+					get_repmgr_schema_quoted(conn), PQerrorMessage(conn));
+
+			if (res != NULL)
+				PQclear(res);
+
+			return false;
+		}
+		PQclear(res);
+	}
+
 	/* CREATE TRIGGER repmgr_repl_nodes_type_check_trg */
 	sqlquery_snprintf(sqlquery,
 					  "CREATE TRIGGER repmgr_repl_nodes_type_check_trg "
