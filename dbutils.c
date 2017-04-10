@@ -1989,7 +1989,7 @@ get_node_replication_state(PGconn *conn, char *node_name, char *output)
 {
 	char		sqlquery[QUERY_STR_LEN];
 	PGresult *	res;
-	
+
 	sqlquery_snprintf(
 		sqlquery,
 		" SELECT state "
@@ -2019,6 +2019,7 @@ get_node_replication_state(PGconn *conn, char *node_name, char *output)
 
 }
 
+
 t_server_type
 parse_node_type(const char *type)
 {
@@ -2033,6 +2034,10 @@ parse_node_type(const char *type)
 	else if (strcmp(type, "witness") == 0)
 	{
 		return WITNESS;
+	}
+	else if (strcmp(type, "bdr") == 0)
+	{
+		return BDR;
 	}
 
 	return UNKNOWN;
@@ -2079,6 +2084,32 @@ is_bdr_db(PGconn *conn)
 		"SELECT COUNT(*) FROM pg_catalog.pg_namespace WHERE nspname='bdr'"
 		);
 
+	res = PQexec(conn, sqlquery);
+
+	if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0)
+	{
+		PQclear(res);
+		return false;
+	}
+
+	return atoi(PQgetvalue(res, 0, 0)) == 1 ? true : false;
+}
+
+bool
+is_table_in_bdr_replication_set(PGconn *conn, char *tablename, char *set)
+{
+	char		sqlquery[QUERY_STR_LEN];
+	PGresult *	res;
+
+	sqlquery_snprintf(
+		sqlquery,
+		"SELECT COUNT(*) "
+		"  FROM UNNEST(bdr.table_get_replication_sets('%s.%s')) AS repset "
+		" WHERE repset='%s' ",
+		get_repmgr_schema_quoted(conn),
+		tablename,
+		tablename
+		);
 	res = PQexec(conn, sqlquery);
 
 	if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0)

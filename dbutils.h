@@ -32,7 +32,8 @@ typedef enum {
 	UNKNOWN = 0,
 	MASTER,
 	STANDBY,
-	WITNESS
+	WITNESS,
+	BDR
 } t_server_type;
 
 /*
@@ -96,6 +97,8 @@ bool		begin_transaction(PGconn *conn);
 bool		commit_transaction(PGconn *conn);
 bool		rollback_transaction(PGconn *conn);
 bool		check_cluster_schema(PGconn *conn);
+bool		is_bdr_database(PGconn *conn);
+bool		is_table_in_bdr_replication_set(PGconn *conn, char *tablename, char *set);
 int			is_standby(PGconn *conn);
 bool		is_pgup(PGconn *conn, int timeout);
 int			get_master_node_id(PGconn *conn, char *cluster);

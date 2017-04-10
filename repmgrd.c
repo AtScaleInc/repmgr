@@ -78,13 +78,18 @@ static void usage(void);
 static void check_cluster_configuration(PGconn *conn);
 static void check_node_configuration(void);
 
+static int main_loop_physical(FILE *fd);
+static int main_loop_bdr(FILE *fd);
+
 static void standby_monitor(void);
 static void witness_monitor(void);
+static void bdr_monitor(void);
+
 static bool check_connection(PGconn **conn, const char *type, const char *conninfo);
 static bool set_local_node_status(void);
 
 static void update_shared_memory(char *last_wal_standby_applied);
-static void update_registration(void);
+static void update_registration(PGconn *conn);
 static void do_master_failover(void);
 static bool do_upstream_standby_failover(t_node_info upstream_node);
 
@@ -142,7 +147,6 @@ main(int argc, char **argv)
 	int			optindex;
 	int			c;
 	bool		daemonize = false;
-	bool        startup_event_logged = false;
 
 	FILE	   *fd;
 
@@ -273,6 +277,28 @@ main(int argc, char **argv)
 	maxlen_snprintf(repmgr_schema, "%s%s", DEFAULT_REPMGR_SCHEMA_PREFIX,
 			 local_options.cluster_name);
 
+
+	switch (local_options.replication_type)
+	{
+		case REPLICATION_TYPE_PHYSICAL:
+			return main_loop_physical(fd);
+			break;
+		case REPLICATION_TYPE_BDR:
+			return main_loop_bdr(fd);
+			break;
+	}
+
+	/* should never get here */
+	log_err(_("unknown replication_type %i\n"), local_options.replication_type);
+	return 1;
+}
+
+
+int
+main_loop_physical(FILE *fd)
+{
+	bool        startup_event_logged = false;
+
 	log_info(_("connecting to database '%s'\n"),
 			 local_options.conninfo);
 	my_local_conn = establish_db_connection(local_options.conninfo, true);
@@ -311,8 +337,8 @@ main(int argc, char **argv)
 
 	if (node_info.node_id == NODE_NOT_FOUND)
 	{
-		log_err(_("No metadata record found for this node - terminating\n"));
-		log_hint(_("Check that 'repmgr (master|standby) register' was executed for this node\n"));
+		log_err(_("no metadata record found for this node - terminating\n"));
+		log_hint(_("check that 'repmgr (master|standby) register' was executed for this node\n"));
 		terminate(ERR_BAD_CONFIG);
 	}
 
@@ -329,25 +355,26 @@ main(int argc, char **argv)
      * we should nevertheless issue a warning and the same hint.
      */
 
+
     if (node_info.active == false)
     {
-        char *hint = "Check that 'repmgr (master|standby) register' was executed for this node";
+        char *hint = "check that 'repmgr (master|standby) register' was executed for this node";
 
         switch (local_options.failover)
         {
             case AUTOMATIC_FAILOVER:
-                log_err(_("This node is marked as inactive and cannot be used for failover\n"));
+                log_err(_("this node is marked as inactive and cannot be used for failover\n"));
                 log_hint(_("%s\n"), hint);
                 terminate(ERR_BAD_CONFIG);
 
             case MANUAL_FAILOVER:
-                log_warning(_("This node is marked as inactive and will be passively monitored only\n"));
+                log_warning(_("this node is marked as inactive and will be passively monitored only\n"));
                 log_hint(_("%s\n"), hint);
                 break;
 
             default:
                 /* This should never happen */
-                log_err(_("Unknown failover mode %i\n"), local_options.failover);
+                log_err(_("unknown failover mode %i\n"), local_options.failover);
                 terminate(ERR_BAD_CONFIG);
         }
 
@@ -385,7 +412,7 @@ main(int argc, char **argv)
 					PQfinish(my_local_conn);
 					my_local_conn = establish_db_connection(local_options.conninfo, true);
 					master_conn = my_local_conn;
-					update_registration();
+					update_registration(master_conn);
 				}
 
 				/* Log startup event */
@@ -451,7 +478,7 @@ main(int argc, char **argv)
 
 							}
 
-							update_registration();
+							update_registration(master_conn);
 						}
 						got_SIGHUP = false;
 					}
@@ -496,7 +523,7 @@ main(int argc, char **argv)
 				{
 					PQfinish(my_local_conn);
 					my_local_conn = establish_db_connection(local_options.conninfo, true);
-					update_registration();
+					update_registration(master_conn);
 				}
 
 				/* Log startup event */
@@ -548,7 +575,9 @@ main(int argc, char **argv)
 					if (node_info.type == WITNESS)
 					{
 						sync_repl_nodes_elapsed += local_options.monitor_interval_secs;
-						log_debug(_("seconds since last node record sync: %i (sync interval: %i)\n"), sync_repl_nodes_elapsed, local_options.witness_repl_nodes_sync_interval_secs);
+						log_debug(_("seconds since last node record sync: %i (sync interval: %i)\n"),
+								  sync_repl_nodes_elapsed,
+								  local_options.witness_repl_nodes_sync_interval_secs);
 						if(sync_repl_nodes_elapsed >= local_options.witness_repl_nodes_sync_interval_secs)
 						{
 							log_debug(_("Resyncing repl_nodes table\n"));
@@ -567,7 +596,7 @@ main(int argc, char **argv)
 						{
 							PQfinish(my_local_conn);
 							my_local_conn = establish_db_connection(local_options.conninfo, true);
-							update_registration();
+							update_registration(master_conn);
 						}
 						got_SIGHUP = false;
 					}
@@ -596,6 +625,101 @@ main(int argc, char **argv)
 	return 0;
 }
 
+
+int
+main_loop_bdr(FILE *fd)
+{
+	bool        startup_event_logged = false;
+
+	log_info(_("connecting to database '%s'\n"),
+			 local_options.conninfo);
+	my_local_conn = establish_db_connection(local_options.conninfo, true);
+
+	/*
+	 * Verify that database is a BDR one
+	 * TODO: check if supported BDR version?
+	 */
+	log_info(_("connected to database, checking for BDR\n"));
+
+	if (!is_bdr_db(my_local_conn))
+	{
+		log_err(_("database is not BDR-enabled\n"));
+		exit(ERR_BAD_CONFIG);
+	}
+
+
+	if (is_table_in_bdr_replication_set(my_local_conn, "repl_nodes", "repmgr"))
+	{
+		log_err(_("repmgr metadata table '%s.%s' is not in the 'repmgr' replication set\n"),
+				get_repmgr_schema_quoted(my_local_conn),
+				"repl_nodes");
+
+		/* TODO: add `repmgr bdr sync` or similar for this situation, and hint here */
+
+		exit(ERR_BAD_CONFIG);
+	}
+
+	/* Retrieve record for this node from the local database */
+	node_info = get_node_info(my_local_conn, local_options.cluster_name, local_options.node);
+
+	/*
+	 * No node record found - exit gracefully
+	 */
+
+	if (node_info.node_id == NODE_NOT_FOUND)
+	{
+		log_err(_("no metadata record found for this node - terminating\n"));
+		log_hint(_("check that 'repmgr bdr register' was executed for this node\n"));
+		terminate(ERR_BAD_CONFIG);
+	}
+
+	// check if inactive node
+	// -> what to do?
+
+
+	/*
+	 * MAIN LOOP
+	 */
+	for (;;)
+	{
+		if (reload_config(&local_options))
+		{
+			PQfinish(my_local_conn);
+			my_local_conn = establish_db_connection(local_options.conninfo, true);
+			update_registration(my_local_conn);
+		}
+
+		/* Log startup event */
+
+		if (startup_event_logged == false)
+		{
+			create_event_record(master_conn,
+								&local_options,
+								local_options.node,
+								"repmgrd_start",
+								true,
+								NULL);
+			startup_event_logged = true;
+		}
+		log_info(_("starting continuous bdr node monitoring\n"));
+
+		/* monitoring loop */
+		do
+		{
+			log_verbose(LOG_DEBUG, "bdr check loop...\n");
+			bdr_monitor();
+
+			if (check_connection(&my_local_conn, "master", NULL))
+			{
+				sleep(local_options.monitor_interval_secs);
+			}
+		} while (!failover_done);
+
+		failover_done = false;
+	} /* End of main loop */
+
+	return 0;
+}
 
 /*
  * witness_monitor()
@@ -1304,6 +1428,10 @@ standby_monitor(void)
 					PQerrorMessage(master_conn));
 }
 
+static void
+bdr_monitor(void)
+{
+}
 
 /*
  * do_master_failover()
@@ -2316,7 +2444,7 @@ check_node_configuration(void)
 	}
 
 	/*
-	 * If there isn't any results then we have not configured this node yet in
+	 * If there aren't any results then we have not configured this node yet in
 	 * repmgr, if that is the case we will insert the node to the cluster,
 	 * except if it is a witness
 	 */
@@ -2485,7 +2613,7 @@ update_shared_memory(char *last_xlog_replay_location)
 }
 
 static void
-update_registration(void)
+update_registration(PGconn *conn)
 {
 	PGresult   *res;
 	char		sqlquery[QUERY_STR_LEN];
@@ -2495,12 +2623,12 @@ update_registration(void)
 					  "   SET conninfo = '%s', "
 					  "       priority = %d "
 					  " WHERE id = %d ",
-					  get_repmgr_schema_quoted(master_conn),
+					  get_repmgr_schema_quoted(conn),
 					  local_options.conninfo,
 					  local_options.priority,
 					  local_options.node);
 
-	res = PQexec(master_conn, sqlquery);
+	res = PQexec(conn, sqlquery);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
 		PQExpBufferData errmsg;
@@ -2508,11 +2636,11 @@ update_registration(void)
 
 		appendPQExpBuffer(&errmsg,
 						  _("unable to update registration: %s"),
-						  PQerrorMessage(master_conn));
+						  PQerrorMessage(conn));
 
 		log_err("%s\n", errmsg.data);
 
-		create_event_record(master_conn,
+		create_event_record(conn,
 							&local_options,
 							local_options.node,
 							"repmgrd_shutdown",
