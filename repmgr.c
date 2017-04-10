@@ -104,6 +104,7 @@ static int  copy_remote_files(char *host, char *remote_user, char *remote_path,
 static int  run_basebackup(const char *data_dir, int server_version_num);
 static void check_parameters_for_action(const int action);
 static bool create_schema(PGconn *conn);
+static void wrap_query(char *query);
 static bool create_recovery_file(const char *data_dir, t_conninfo_param_list *recovery_conninfo);
 static void write_primary_conninfo(char *line, t_conninfo_param_list *param_list);
 static bool write_recovery_file_line(FILE *recovery_file, char *recovery_file_path, char *line);
@@ -6583,11 +6584,23 @@ do_witness_unregister(void)
 	return;
 }
 
-
+/*
+ * do_bdr_register()
+ *
+ * As each BDR node is its own master, registering a BDR node
+ * will create the repmgr metadata schema if necessary.
+ */
 static void
 do_bdr_register(void)
 {
 	PGconn	   *conn;
+	PGresult   *res;
+	bool		repmgr_schema_exists;
+	t_node_info node_info = T_NODE_INFO_INITIALIZER;
+	char		sqlquery[QUERY_STR_LEN];
+	int			c;
+	bool		node_recorded;
+	PQExpBufferData event_details;
 
 	/* sanity-check configuration for BDR-compatability */
 	if (options.replication_type != REPLICATION_TYPE_BDR)
@@ -6602,9 +6615,171 @@ do_bdr_register(void)
 	{
 		/* TODO: name database */
 		log_err(_("database is not BDR-enabled\n"));
+		log_hint(_("when using repmgr with BDR, the repmgr schema must be stored in the BDR database\n"));
 		exit(ERR_BAD_CONFIG);
 	}
 
+	// check if repmgr schema exists, and that any other nodes are BDR
+	repmgr_schema_exists = check_cluster_schema(conn);
+
+	if (repmgr_schema_exists == true)
+	{
+		int		non_bdr_nodes;
+
+		// XXX move to dbutils.c
+		sqlquery_snprintf(sqlquery,
+						  "SELECT COUNT(*)"
+						  "  FROM %s.repl_nodes"
+						  " WHERE type != 'bdr' ",
+						  get_repmgr_schema_quoted(conn));
+
+		// XXX check result
+		res = PQexec(conn, sqlquery);
+		non_bdr_nodes = atoi(PQgetvalue(res, 0, 0));
+
+		if (non_bdr_nodes > 0)
+		{
+			log_err(_("repmgr schema contains records for non-BDR nodes\n"));
+			exit(ERR_BAD_CONFIG);
+		}
+	}
+	else
+	{
+		log_info(_("bdr register: creating database objects inside the %s schema\n"),
+				 get_repmgr_schema());
+
+		begin_transaction(conn);
+
+		if (!create_schema(conn))
+		{
+			log_err(_("unable to create repmgr schema - see preceding error message(s); aborting\n"));
+			rollback_transaction(conn);
+			PQfinish(conn);
+			exit(ERR_BAD_CONFIG);
+		}
+
+		commit_transaction(conn);
+	}
+
+	/* check for a matching BDR node */
+	sqlquery_snprintf(sqlquery,
+					  "SELECT COUNT(*)"
+					  "  FROM bdr.bdr_nodes"
+					  " WHERE node_name = '%s'",
+					  options.node_name);
+
+	// XXX check result
+	res = PQexec(conn, sqlquery);
+	c = atoi(PQgetvalue(res, 0, 0));
+
+	if (c == 0)
+	{
+		log_err(_("no BDR node with node_name '%s' found\n"), options.node_name);
+		log_hint(_("'node_name' in repmgr.conf must match 'node_name' in bdr.bdr_nodes\n"));
+		PQfinish(conn);
+		exit(ERR_BAD_CONFIG);
+	}
+
+	initPQExpBuffer(&event_details);
+
+	begin_transaction(conn);
+
+	/*
+	 * we'll check if a record exists (even if the schema was just created),
+	 * as there's a faint chance of a race condition
+	 */
+
+	if (get_node_record(conn, options.cluster_name, options.node, &node_info))
+	{
+		/*
+		 * At this point we will have established there are no non-BDR records,
+		 * so no need to verify the node type
+		 */
+		if (!runtime_options.force)
+		{
+			log_err(_("this node is already registered\n"));
+			log_hint(_("use -F/--force to overwrite the existing node record\n"));
+			rollback_transaction(conn);
+			PQfinish(conn);
+			exit(ERR_BAD_CONFIG);
+		}
+
+		/*
+		 * don't permit changing the node name - this must match the
+		 * BDR node name set when the node was registered.
+		 */
+
+		if (strncmp(node_info.name, options.node_name, MAXLEN) != 0)
+		{
+			log_err(_("a record for node %i is already registered with node_name '%s'\n"), options.node, node_info.name);
+			log_hint(_("node_name configured in repmgr.conf is '%s'\n"), options.node_name);
+
+			rollback_transaction(conn);
+			PQfinish(conn);
+			exit(ERR_BAD_CONFIG);
+		}
+
+		node_recorded = update_node_record(conn,
+										   "bdr register",
+										   options.node,
+										   "bdr",
+										   NO_UPSTREAM_NODE,
+										   options.cluster_name,
+										   options.node_name,
+										   options.conninfo,
+										   options.priority,
+										   NULL,
+										   true);
+		if (node_recorded == true)
+		{
+			appendPQExpBuffer(&event_details, _("node record updated for node %i ('%s')"), options.node, options.node_name);
+			log_verbose(LOG_NOTICE, "%s\n", event_details.data);
+		}
+	}
+	else
+	{
+		/* create new node record */
+		node_recorded = create_node_record(conn,
+										   "bdr register",
+										   options.node,
+										   "bdr",
+										   NO_UPSTREAM_NODE,
+										   options.cluster_name,
+										   options.node_name,
+										   options.conninfo,
+										   options.priority,
+										   NULL,
+										   true);
+		if (node_recorded == true)
+		{
+			appendPQExpBuffer(&event_details,_("node record created for node %i ('%s') \n"), options.node, options.node_name);
+			log_verbose(LOG_NOTICE, "%s\n", event_details.data);
+		}
+
+	}
+
+	if (node_recorded == false)
+	{
+		rollback_transaction(conn);
+		PQfinish(conn);
+		exit(ERR_DB_QUERY);
+	}
+
+	commit_transaction(conn);
+	/* Log the event */
+	create_event_record(conn,
+						&options,
+						options.node,
+						"bdr_register",
+						true,
+						event_details.data);
+
+	termPQExpBuffer(&event_details);
+
+	PQfinish(conn);
+
+	log_notice(_("BDR node correctly registered for cluster %s with id %d (conninfo: %s)\n"),
+			   options.cluster_name, options.node, options.conninfo);
 }
 
 
@@ -7476,9 +7651,12 @@ create_schema(PGconn *conn)
 
 	/* create schema */
 	sqlquery_snprintf(sqlquery, "CREATE SCHEMA %s", get_repmgr_schema_quoted(conn));
+
+	wrap_query(sqlquery);
+
 	log_debug(_("create_schema: %s\n"), sqlquery);
 	res = PQexec(conn, sqlquery);
-	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+	if (!res || (PQresultStatus(res) != PGRES_COMMAND_OK && PQresultStatus(res) != PGRES_TUPLES_OK))
 	{
 		log_err(_("unable to create the schema %s: %s\n"),
 				get_repmgr_schema(), PQerrorMessage(conn));
@@ -7493,50 +7671,53 @@ create_schema(PGconn *conn)
 
 	/* create functions */
 
-	/*
-	 * to avoid confusion of the time_lag field and provide a consistent UI we
-	 * use these functions for providing the latest update timestamp
-	 */
-	sqlquery_snprintf(sqlquery,
-					  "CREATE FUNCTION %s.repmgr_update_last_updated() "
-					  "  RETURNS TIMESTAMP WITH TIME ZONE "
-					  "  AS '$libdir/repmgr_funcs', 'repmgr_update_last_updated' "
-					  "  LANGUAGE C STRICT ",
-					  get_repmgr_schema_quoted(conn));
-
-	res = PQexec(conn, sqlquery);
-	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+	if (options.replication_type != REPLICATION_TYPE_BDR)
 	{
-		log_err(_("unable to create the function repmgr_update_last_updated: %s\n"),
-				PQerrorMessage(conn));
+		/*
+		 * to avoid confusion of the time_lag field and provide a consistent UI we
+		 * use these functions for providing the latest update timestamp
+		 */
+		sqlquery_snprintf(sqlquery,
+						  "CREATE FUNCTION %s.repmgr_update_last_updated() "
+						  "  RETURNS TIMESTAMP WITH TIME ZONE "
+						  "  AS '$libdir/repmgr_funcs', 'repmgr_update_last_updated' "
+						  "  LANGUAGE C STRICT ",
+						  get_repmgr_schema_quoted(conn));
 
-		if (res != NULL)
-			PQclear(res);
+		res = PQexec(conn, sqlquery);
+		if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+		{
+			log_err(_("unable to create the function repmgr_update_last_updated: %s\n"),
+					PQerrorMessage(conn));
 
-		return false;
+			if (res != NULL)
+				PQclear(res);
+
+			return false;
+		}
+		PQclear(res);
+
+
+		sqlquery_snprintf(sqlquery,
+						  "CREATE FUNCTION %s.repmgr_get_last_updated() "
+						  "  RETURNS TIMESTAMP WITH TIME ZONE "
+						  "  AS '$libdir/repmgr_funcs', 'repmgr_get_last_updated' "
+						  "  LANGUAGE C STRICT ",
+						  get_repmgr_schema_quoted(conn));
+
+		res = PQexec(conn, sqlquery);
+		if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+		{
+			log_err(_("unable to create the function repmgr_get_last_updated(): %s\n"),
+					PQerrorMessage(conn));
+
+			if (res != NULL)
+				PQclear(res);
+
+			return false;
+		}
+		PQclear(res);
 	}
-	PQclear(res);
-
-
-	sqlquery_snprintf(sqlquery,
-					  "CREATE FUNCTION %s.repmgr_get_last_updated() "
-					  "  RETURNS TIMESTAMP WITH TIME ZONE "
-					  "  AS '$libdir/repmgr_funcs', 'repmgr_get_last_updated' "
-					  "  LANGUAGE C STRICT ",
-					  get_repmgr_schema_quoted(conn));
-
-	res = PQexec(conn, sqlquery);
-	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
-	{
-		log_err(_("unable to create the function repmgr_get_last_updated(): %s\n"),
-				PQerrorMessage(conn));
-
-		if (res != NULL)
-			PQclear(res);
-
-		return false;
-	}
-	PQclear(res);
 
 	sqlquery_snprintf(sqlquery,
 					  "CREATE OR REPLACE FUNCTION %s.repmgr_validate_type() "
@@ -7579,10 +7760,12 @@ create_schema(PGconn *conn)
 					  get_repmgr_schema_quoted(conn),
 					  get_repmgr_schema_quoted(conn));
 
+	wrap_query(sqlquery);
+
 	res = PQexec(conn, sqlquery);
-	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+	if (!res || (PQresultStatus(res) != PGRES_COMMAND_OK && PQresultStatus(res) != PGRES_TUPLES_OK))
 	{
-		log_err(_("unable to create the function rrepmgr_validate_type(): %s\n"),
+		log_err(_("unable to create the function repmgr_validate_type(): %s\n"),
 				PQerrorMessage(conn));
 
 		if (res != NULL)
@@ -7610,9 +7793,11 @@ create_schema(PGconn *conn)
 					  get_repmgr_schema_quoted(conn),
 					  get_repmgr_schema_quoted(conn));
 
+	wrap_query(sqlquery);
+
 	log_debug(_("create_schema: %s\n"), sqlquery);
 	res = PQexec(conn, sqlquery);
-	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+	if (!res || (PQresultStatus(res) != PGRES_COMMAND_OK && PQresultStatus(res) != PGRES_TUPLES_OK))
 	{
 		log_err(_("unable to create table '%s.repl_nodes': %s\n"),
 				get_repmgr_schema_quoted(conn), PQerrorMessage(conn));
@@ -7633,8 +7818,11 @@ create_schema(PGconn *conn)
  					  " EXECUTE PROCEDURE %s.repmgr_validate_type() ",
 					  get_repmgr_schema_quoted(conn),
 					  get_repmgr_schema_quoted(conn));
+
+	wrap_query(sqlquery);
+
 	res = PQexec(conn, sqlquery);
-	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+	if (!res || (PQresultStatus(res) != PGRES_COMMAND_OK && PQresultStatus(res) != PGRES_TUPLES_OK))
 	{
 		log_err(_("unable to create trigger 'repmgr_repl_nodes_type_check_trg' on '%s.repl_nodes': %s\n"),
 				get_repmgr_schema_quoted(conn), PQerrorMessage(conn));
@@ -7646,32 +7834,38 @@ create_schema(PGconn *conn)
 	}
 	PQclear(res);
 
-	/* CREATE TABLE repl_monitor */
-
-	sqlquery_snprintf(sqlquery,
-					  "CREATE TABLE %s.repl_monitor ( "
-					  "  primary_node                   INTEGER NOT NULL, "
-					  "  standby_node                   INTEGER NOT NULL, "
-					  "  last_monitor_time              TIMESTAMP WITH TIME ZONE NOT NULL, "
-					  "  last_apply_time                TIMESTAMP WITH TIME ZONE, "
-					  "  last_wal_primary_location      TEXT NOT NULL,   "
-					  "  last_wal_standby_location      TEXT,  "
-					  "  replication_lag                BIGINT NOT NULL, "
-					  "  apply_lag                      BIGINT NOT NULL) ",
-					  get_repmgr_schema_quoted(conn));
-	log_debug(_("create_schema: %s\n"), sqlquery);
-	res = PQexec(conn, sqlquery);
-	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+	if (options.replication_type != REPLICATION_TYPE_BDR)
 	{
-		log_err(_("unable to create table '%s.repl_monitor': %s\n"),
-				get_repmgr_schema_quoted(conn), PQerrorMessage(conn));
+		/* CREATE TABLE repl_monitor */
 
-		if (res != NULL)
-			PQclear(res);
+		sqlquery_snprintf(sqlquery,
+						  "CREATE TABLE %s.repl_monitor ( "
+						  "  primary_node                   INTEGER NOT NULL, "
+						  "  standby_node                   INTEGER NOT NULL, "
+						  "  last_monitor_time              TIMESTAMP WITH TIME ZONE NOT NULL, "
+						  "  last_apply_time                TIMESTAMP WITH TIME ZONE, "
+						  "  last_wal_primary_location      TEXT NOT NULL,   "
+						  "  last_wal_standby_location      TEXT,  "
+						  "  replication_lag                BIGINT NOT NULL, "
+						  "  apply_lag                      BIGINT NOT NULL) ",
+						  get_repmgr_schema_quoted(conn));
 
-		return false;
+
+		log_debug(_("create_schema: %s\n"), sqlquery);
+
+		res = PQexec(conn, sqlquery);
+		if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+		{
+			log_err(_("unable to create table '%s.repl_monitor': %s\n"),
+					get_repmgr_schema_quoted(conn), PQerrorMessage(conn));
+
+			if (res != NULL)
+				PQclear(res);
+
+			return false;
+		}
+		PQclear(res);
 	}
-	PQclear(res);
 
 	/* CREATE TABLE repl_events */
 
@@ -7685,9 +7879,11 @@ create_schema(PGconn *conn)
 					  " ) ",
 					  get_repmgr_schema_quoted(conn));
 
+	wrap_query(sqlquery);
+
 	log_debug(_("create_schema: %s\n"), sqlquery);
 	res = PQexec(conn, sqlquery);
-	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+	if (!res || (PQresultStatus(res) != PGRES_COMMAND_OK && PQresultStatus(res) != PGRES_TUPLES_OK))
 	{
 		log_err(_("unable to create table '%s.repl_events': %s\n"),
 				get_repmgr_schema_quoted(conn), PQerrorMessage(conn));
@@ -7699,64 +7895,66 @@ create_schema(PGconn *conn)
 	}
 	PQclear(res);
 
-	/* CREATE VIEW repl_status  */
-	sqlquery_snprintf(sqlquery,
-					  "CREATE VIEW %s.repl_status AS "
-					  "  SELECT m.primary_node, m.standby_node, n.name AS standby_name, "
-					  "         n.type AS node_type, n.active, last_monitor_time, "
-					  "         CASE WHEN n.type='standby' THEN m.last_wal_primary_location ELSE NULL END AS last_wal_primary_location, "
-					  "         m.last_wal_standby_location, "
-					  "         CASE WHEN n.type='standby' THEN pg_size_pretty(m.replication_lag) ELSE NULL END AS replication_lag, "
-					  "         CASE WHEN n.type='standby' THEN age(now(), m.last_apply_time) ELSE NULL END AS replication_time_lag, "
-					  "         CASE WHEN n.type='standby' THEN pg_size_pretty(m.apply_lag) ELSE NULL END AS apply_lag, "
-					  "         age(now(), CASE WHEN pg_is_in_recovery() THEN %s.repmgr_get_last_updated() ELSE m.last_monitor_time END) AS communication_time_lag "
-					  "    FROM %s.repl_monitor m "
-					  "    JOIN %s.repl_nodes n ON m.standby_node = n.id "
-					  "   WHERE (m.standby_node, m.last_monitor_time) IN ( "
-					  "                 SELECT m1.standby_node, MAX(m1.last_monitor_time) "
-					  "                  FROM %s.repl_monitor m1 GROUP BY 1 "
-					  "            )",
-					  get_repmgr_schema_quoted(conn),
-					  get_repmgr_schema_quoted(conn),
-					  get_repmgr_schema_quoted(conn),
-					  get_repmgr_schema_quoted(conn),
-					  get_repmgr_schema_quoted(conn));
-	log_debug(_("create_schema: %s\n"), sqlquery);
-
-	res = PQexec(conn, sqlquery);
-	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+	if (options.replication_type != REPLICATION_TYPE_BDR)
 	{
-		log_err(_("unable to create view %s.repl_status: %s\n"),
-				get_repmgr_schema_quoted(conn), PQerrorMessage(conn));
+		/* CREATE VIEW repl_status  */
+		sqlquery_snprintf(sqlquery,
+						  "CREATE VIEW %s.repl_status AS "
+						  "  SELECT m.primary_node, m.standby_node, n.name AS standby_name, "
+						  "         n.type AS node_type, n.active, last_monitor_time, "
+						  "         CASE WHEN n.type='standby' THEN m.last_wal_primary_location ELSE NULL END AS last_wal_primary_location, "
+						  "         m.last_wal_standby_location, "
+						  "         CASE WHEN n.type='standby' THEN pg_size_pretty(m.replication_lag) ELSE NULL END AS replication_lag, "
+						  "         CASE WHEN n.type='standby' THEN age(now(), m.last_apply_time) ELSE NULL END AS replication_time_lag, "
+						  "         CASE WHEN n.type='standby' THEN pg_size_pretty(m.apply_lag) ELSE NULL END AS apply_lag, "
+						  "         age(now(), CASE WHEN pg_is_in_recovery() THEN %s.repmgr_get_last_updated() ELSE m.last_monitor_time END) AS communication_time_lag "
+						  "    FROM %s.repl_monitor m "
+						  "    JOIN %s.repl_nodes n ON m.standby_node = n.id "
+						  "   WHERE (m.standby_node, m.last_monitor_time) IN ( "
+						  "                 SELECT m1.standby_node, MAX(m1.last_monitor_time) "
+						  "                  FROM %s.repl_monitor m1 GROUP BY 1 "
+						  "            )",
+						  get_repmgr_schema_quoted(conn),
+						  get_repmgr_schema_quoted(conn),
+						  get_repmgr_schema_quoted(conn),
+						  get_repmgr_schema_quoted(conn),
+						  get_repmgr_schema_quoted(conn));
+		log_debug(_("create_schema: %s\n"), sqlquery);
 
-		if (res != NULL)
-			PQclear(res);
+		res = PQexec(conn, sqlquery);
+		if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+		{
+			log_err(_("unable to create view %s.repl_status: %s\n"),
+					get_repmgr_schema_quoted(conn), PQerrorMessage(conn));
 
-		return false;
+			if (res != NULL)
+				PQclear(res);
+
+			return false;
+		}
+		PQclear(res);
+
+
+		/* an index to improve performance of the view */
+		sqlquery_snprintf(sqlquery,
+						  "CREATE INDEX idx_repl_status_sort "
+						  "    ON %s.repl_monitor (last_monitor_time, standby_node) ",
+						  get_repmgr_schema_quoted(conn));
+
+		log_debug(_("create_schema: %s\n"), sqlquery);
+		res = PQexec(conn, sqlquery);
+		if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+		{
+			log_err(_("unable to create index 'idx_repl_status_sort' on '%s.repl_monitor': %s\n"),
+					get_repmgr_schema_quoted(conn), PQerrorMessage(conn));
+
+			if (res != NULL)
+				PQclear(res);
+
+			return false;
+		}
+		PQclear(res);
 	}
-	PQclear(res);
-
-
-	/* an index to improve performance of the view */
-	sqlquery_snprintf(sqlquery,
-					  "CREATE INDEX idx_repl_status_sort "
-					  "    ON %s.repl_monitor (last_monitor_time, standby_node) ",
-					  get_repmgr_schema_quoted(conn));
-
-	log_debug(_("create_schema: %s\n"), sqlquery);
-	res = PQexec(conn, sqlquery);
-	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
-	{
-		log_err(_("unable to create index 'idx_repl_status_sort' on '%s.repl_monitor': %s\n"),
-				get_repmgr_schema_quoted(conn), PQerrorMessage(conn));
-
-		if (res != NULL)
-			PQclear(res);
-
-		return false;
-	}
-	PQclear(res);
-
 
 	/* CREATE VIEW repl_show_nodes  */
 	sqlquery_snprintf(sqlquery,
@@ -7771,10 +7969,12 @@ create_schema(PGconn *conn)
 			  get_repmgr_schema_quoted(conn),
 			  get_repmgr_schema_quoted(conn));
 
+	wrap_query(sqlquery);
+
 	log_debug(_("create_schema: %s\n"), sqlquery);
 
 	res = PQexec(conn, sqlquery);
-	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+	if (!res || (PQresultStatus(res) != PGRES_COMMAND_OK && PQresultStatus(res) != PGRES_TUPLES_OK))
 	{
 		log_err(_("unable to create view %s.repl_show_nodes: %s\n"),
 				get_repmgr_schema_quoted(conn), PQerrorMessage(conn));
@@ -7786,52 +7986,83 @@ create_schema(PGconn *conn)
 	}
 	PQclear(res);
 
-
-	/*
-	 * XXX Here we MUST try to load the repmgr_function.sql not hardcode it
-	 * here
-	 */
-	sqlquery_snprintf(sqlquery,
-					  "CREATE OR REPLACE FUNCTION %s.repmgr_update_standby_location(text) "
-					  "  RETURNS boolean "
-					  "  AS '$libdir/repmgr_funcs', 'repmgr_update_standby_location' "
-					  "  LANGUAGE C STRICT ",
-					  get_repmgr_schema_quoted(conn));
-
-	res = PQexec(conn, sqlquery);
-	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+	if (options.replication_type != REPLICATION_TYPE_BDR)
 	{
-		fprintf(stderr, "Cannot create the function repmgr_update_standby_location: %s\n",
-				PQerrorMessage(conn));
 
-		if (res != NULL)
-			PQclear(res);
+		/*
+		 * XXX Here we MUST try to load the repmgr_function.sql not hardcode it
+		 * here
+		 */
+		sqlquery_snprintf(sqlquery,
+						  "CREATE OR REPLACE FUNCTION %s.repmgr_update_standby_location(text) "
+						  "  RETURNS boolean "
+						  "  AS '$libdir/repmgr_funcs', 'repmgr_update_standby_location' "
+						  "  LANGUAGE C STRICT ",
+						  get_repmgr_schema_quoted(conn));
 
-		return false;
+		res = PQexec(conn, sqlquery);
+		if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+		{
+			fprintf(stderr, "Cannot create the function repmgr_update_standby_location: %s\n",
+					PQerrorMessage(conn));
+
+			if (res != NULL)
+				PQclear(res);
+
+			return false;
+		}
+		PQclear(res);
+
+		sqlquery_snprintf(sqlquery,
+						  "CREATE OR REPLACE FUNCTION %s.repmgr_get_last_standby_location() "
+						  "  RETURNS text "
+						  "  AS '$libdir/repmgr_funcs', 'repmgr_get_last_standby_location' "
+						  "  LANGUAGE C STRICT ",
+						  get_repmgr_schema_quoted(conn));
+
+		res = PQexec(conn, sqlquery);
+		if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+		{
+			fprintf(stderr, "Cannot create the function repmgr_get_last_standby_location: %s\n",
+					PQerrorMessage(conn));
+
+			if (res != NULL)
+				PQclear(res);
+
+			return false;
+		}
+		PQclear(res);
 	}
-	PQclear(res);
-
-	sqlquery_snprintf(sqlquery,
-					  "CREATE OR REPLACE FUNCTION %s.repmgr_get_last_standby_location() "
-					  "  RETURNS text "
-					  "  AS '$libdir/repmgr_funcs', 'repmgr_get_last_standby_location' "
-					  "  LANGUAGE C STRICT ",
-					  get_repmgr_schema_quoted(conn));
-
-	res = PQexec(conn, sqlquery);
-	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
-	{
-		fprintf(stderr, "Cannot create the function repmgr_get_last_standby_location: %s\n",
-				PQerrorMessage(conn));
-
-		if (res != NULL)
-			PQclear(res);
-
-		return false;
-	}
-	PQclear(res);
 
 	return true;
+}
+
+
+/*
+ * Wrap query with appropriate DDL function, if required.
+ */
+void
+wrap_query(char *query)
+{
+	PQExpBufferData query_buf;
+
+	initPQExpBuffer(&query_buf);
+
+	if (options.replication_type == REPLICATION_TYPE_BDR)
+	{
+		appendPQExpBuffer(&query_buf, "SELECT bdr.bdr_replicate_ddl_command($repmgr$");
+	}
+
+	appendPQExpBuffer(&query_buf, "%s", query);
+
+	if (options.replication_type == REPLICATION_TYPE_BDR)
+	{
+		appendPQExpBuffer(&query_buf, "$repmgr$)");
+	}
+
+	sqlquery_snprintf(query, "%s", query_buf.data);
+
+	termPQExpBuffer(&query_buf);
 }
 
 
