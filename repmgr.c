@@ -1657,7 +1657,7 @@ build_cluster_crosscheck(t_node_status_cube ***dest_cube, int *name_length)
 
 		p = command_output.data;
 
-		if(!strlen(command_output.data))
+		if (!strlen(command_output.data))
 		{
 			continue;
 		}
@@ -2478,13 +2478,17 @@ do_standby_unregister(void)
 
 	if (!get_node_record(master_conn, options.cluster_name, target_node_id, &node_info))
 	{
-		log_err(_("No record found for node %i\n"), target_node_id);
+		log_err(_("no record found for node %i\n"), target_node_id);
+		PQfinish(master_conn);
+		PQfinish(conn);
 		exit(ERR_BAD_CONFIG);
 	}
 
 	if (node_info.type != STANDBY)
 	{
 		log_err(_("Node %i is not a standby server\n"), target_node_id);
+		PQfinish(master_conn);
+		PQfinish(conn);
 		exit(ERR_BAD_CONFIG);
 	}
 
@@ -6626,22 +6630,9 @@ do_bdr_register(void)
 
 	if (repmgr_schema_exists == true)
 	{
-		int		non_bdr_nodes;
-
-		// XXX move to dbutils.c
-		sqlquery_snprintf(sqlquery,
-						  "SELECT COUNT(*)"
-						  "  FROM %s.repl_nodes"
-						  " WHERE type != 'bdr' ",
-						  get_repmgr_schema_quoted(conn));
-
-		// XXX check result
-		res = PQexec(conn, sqlquery);
-		non_bdr_nodes = atoi(PQgetvalue(res, 0, 0));
-
-		if (non_bdr_nodes > 0)
+		if (!is_bdr_repmgr(conn))
 		{
-			log_err(_("repmgr schema contains records for non-BDR nodes\n"));
+			log_err(_("repmgr metadatabase contains records for non-BDR nodes\n"));
 			exit(ERR_BAD_CONFIG);
 		}
 	}
@@ -6734,7 +6725,8 @@ do_bdr_register(void)
 										   true);
 		if (node_recorded == true)
 		{
-			appendPQExpBuffer(&event_details, _("node record updated for node %i ('%s')"), options.node, options.node_name);
+			appendPQExpBuffer(&event_details, _("node record updated for node '%s' (%i)"),
+							  options.node_name, options.node);
 			log_verbose(LOG_NOTICE, "%s\n", event_details.data);
 		}
 	}
@@ -6754,7 +6746,8 @@ do_bdr_register(void)
 										   true);
 		if (node_recorded == true)
 		{
-			appendPQExpBuffer(&event_details,_("node record created for node '%s'(ID: %i)"), options.node_name, options.node);
+			appendPQExpBuffer(&event_details,_("node record created for node '%s' (ID: %i)"),
+							  options.node_name, options.node);
 			log_verbose(LOG_NOTICE, "%s\n", event_details.data);
 		}
 
@@ -6788,7 +6781,101 @@ do_bdr_register(void)
 static void
 do_bdr_unregister(void)
 {
-	puts("write code here");
+	PGconn	   *conn;
+	bool		repmgr_schema_exists;
+	bool		node_record_deleted;
+	PQExpBufferData event_details;
+	int 		target_node_id;
+	t_node_info node_info = T_NODE_INFO_INITIALIZER;
+
+	/* sanity-check configuration for BDR-compatability */
+
+	if (options.replication_type != REPLICATION_TYPE_BDR)
+	{
+		log_err(_("cannot run BDR UNREGISTER on a non-BDR node\n"));
+		exit(ERR_BAD_CONFIG);
+	}
+
+	conn = establish_db_connection(options.conninfo, true);
+
+	if (!is_bdr_db(conn))
+	{
+		/* TODO: name database */
+		log_err(_("database is not BDR-enabled\n"));
+		exit(ERR_BAD_CONFIG);
+	}
+
+	repmgr_schema_exists = check_cluster_schema(conn);
+
+	if (repmgr_schema_exists == false)
+	{
+		log_err(_("repmgr is not installed on this database\n"));
+		exit(ERR_BAD_CONFIG);
+	}
+
+	if (!is_bdr_repmgr(conn))
+	{
+		log_err(_("repmgr metadatabase contains records for non-BDR nodes\n"));
+		exit(ERR_BAD_CONFIG);
+	}
+
+	log_info("OK\n");
+
+
+	initPQExpBuffer(&event_details);
+	if (runtime_options.node != UNKNOWN_NODE_ID)
+		target_node_id = runtime_options.node;
+	else
+		target_node_id = options.node;
+
+
+	/* Check node exists and is really a standby */
+
+	if (!get_node_record(conn, options.cluster_name, target_node_id, &node_info))
+	{
+		log_err(_("no record found for node %i\n"), target_node_id);
+		PQfinish(conn);
+		exit(ERR_BAD_CONFIG);
+	}
+
+	begin_transaction(conn);
+
+	log_info(_("unregistering the standby\n"));
+	node_record_deleted = delete_node_record(conn,
+										     target_node_id,
+											 "bdr unregister");
+
+	if (node_record_deleted == false)
+	{
+		appendPQExpBuffer(&event_details,
+						  "unable to delete node record for node '%s' (ID: %i)",
+						  node_info.name,
+						  target_node_id);
+	}
+	else
+	{
+		appendPQExpBuffer(&event_details,
+						  "node record deleted for node '%s' (ID: %i)",
+						  node_info.name,
+						  target_node_id);
+	}
+	commit_transaction(conn);
+
+	/* Log the event */
+	create_event_record(conn,
+						&options,
+						options.node,
+						"bdr_unregister",
+						true,
+						event_details.data);
+
+	PQfinish(conn);
+
+	log_info(_("bdr unregistration complete\n"));
+	log_notice(_("bdr node '%s' correctly unregistered for cluster %s with id %d (conninfo: %s)\n"),
+			   node_info.name, options.cluster_name, target_node_id, options.conninfo);
+
+	termPQExpBuffer(&event_details);
 }
 
 
@@ -6853,6 +6940,8 @@ do_help(void)
 
 	printf(_("  --wait-sync[=VALUE]                 (standby register) wait for the node record to synchronise to the\n"\
 			 "                                        standby (optional timeout in seconds)\n"));
+	printf(_("  --node=VALUE                        (standby|witness|bdr unregister) specify when unregistering a node\n"\
+			 "                                        which is not running\n"));
 	printf(_("  --recovery-min-apply-delay=VALUE    (standby follow) set recovery_min_apply_delay\n" \
 			 "                                        in recovery.conf (PostgreSQL 9.4 and later)\n"));
 	printf(_("  --replication-user                  (standby follow) username to set in 'primary_conninfo' in recovery.conf\n"));
@@ -6881,6 +6970,8 @@ do_help(void)
 	printf(_(" witness create        - creates a new witness server\n"));
 	printf(_(" witness register      - registers a witness server\n"));
 	printf(_(" witness unregister    - unregisters a witness server\n"));
+	printf(_(" bdr register          - registers a BDR node\n"));
+	printf(_(" bdr unregister        - unregisters a BDR node\n"));
 	printf(_(" cluster show          - displays information about cluster nodes\n"));
 	printf(_(" cluster matrix        - displays the cluster's connection matrix\n" \
 	         "                           as seen from the current node\n"));
@@ -7622,7 +7713,7 @@ check_parameters_for_action(const int action)
 	}
 
 	/* Warn about parameters which apply to WITNESS UNREGISTER only */
-	if (action != WITNESS_UNREGISTER && action != STANDBY_UNREGISTER && action != CLUSTER_MATRIX)
+	if (action != WITNESS_UNREGISTER && action != STANDBY_UNREGISTER && action != BDR_UNREGISTER && action != CLUSTER_MATRIX)
 	{
 		if (runtime_options.node != UNKNOWN_NODE_ID)
 		{

@@ -1431,8 +1431,9 @@ Additionally the following format is available for the event type
 `bdr_failover`:
 
     %c - conninfo string of the next available node
+    %a - name of the next available node
 
-This should always be quoted.
+These should always be quoted.
 
 By default, all notifications will be passed; the notification types
 can be filtered to explicitly named ones:
@@ -1457,6 +1458,8 @@ The following event types are available:
   * `repmgrd_failover_promote`
   * `repmgrd_failover_follow`
   * `bdr_failover`
+  * `bdr_register`
+  * `bdr_unregister`
 
 Note that under some circumstances (e.g. no replication cluster master could
 be located), it will not be possible to write an entry into the `repl_events`

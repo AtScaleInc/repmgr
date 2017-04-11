@@ -2244,6 +2244,27 @@ is_bdr_db(PGconn *conn)
 }
 
 bool
+is_bdr_repmgr(PGconn *conn)
+{
+	char		sqlquery[QUERY_STR_LEN];
+	PGresult   *res;
+	int		non_bdr_nodes;
+
+	sqlquery_snprintf(sqlquery,
+					  "SELECT COUNT(*)"
+					  "  FROM %s.repl_nodes"
+					  " WHERE type != 'bdr' ",
+					  get_repmgr_schema_quoted(conn));
+
+	// XXX check result
+	res = PQexec(conn, sqlquery);
+	non_bdr_nodes = atoi(PQgetvalue(res, 0, 0));
+
+	return (non_bdr_nodes == 0) ? true : false;
+}
+
+
+bool
 is_table_in_bdr_replication_set(PGconn *conn, char *tablename, char *set)
 {
 	char		sqlquery[QUERY_STR_LEN];

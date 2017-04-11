@@ -174,6 +174,7 @@ int			get_data_checksum_version(const char *data_directory);
 bool		set_node_active_status(PGconn *conn, int node_id, bool status);
 
 bool		is_bdr_db(PGconn *conn);
+bool		is_bdr_repmgr(PGconn *conn);
 bool		is_table_in_bdr_replication_set(PGconn *conn, char *tablename, char *set);
 bool		add_table_to_bdr_replication_set(PGconn *conn, char *tablename, char *set);
 #endif
