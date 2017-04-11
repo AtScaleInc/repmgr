@@ -1146,6 +1146,8 @@ do_cluster_show(void)
 
 		if (PQstatus(conn) != CONNECTION_OK)
 			strcpy(node_role, "  FAILED");
+		else if (strcmp(PQgetvalue(res, i, 1), "bdr") == 0)
+			strcpy(node_role, "      bdr");
 		else if (strcmp(PQgetvalue(res, i, 1), "witness") == 0)
 			strcpy(node_role, "  witness");
 		else if (is_standby(conn))
