@@ -52,6 +52,9 @@
 #define NO_UPSTREAM_NODE	-1
 #define UNKNOWN_NODE_ID     -1
 
+#define BDR_MONITORING_LOCAL    1
+#define BDR_MONITORING_PRIORITY 2
+
 /* command line options without short versions */
 #define OPT_HELP                         1
 #define OPT_CHECK_UPSTREAM_CONFIG        2

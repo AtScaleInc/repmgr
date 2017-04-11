@@ -1953,6 +1953,25 @@ get_node_record(PGconn *conn, char *cluster, int node_id, t_node_info *node_info
 	return result;
 }
 
+
+t_node_info *
+get_node_record_pointer(PGconn *conn, char *cluster, int node_id)
+{
+	t_node_info *node_info = pg_malloc0(sizeof(t_node_info));
+	int		     result;
+
+	result = get_node_record(conn, cluster, node_id, node_info);
+
+	if (result == 0)
+	{
+		pfree(node_info);
+		return NULL;
+	}
+
+	return node_info;
+}
+
+
 int
 get_node_record_by_name(PGconn *conn, char *cluster, const char *node_name, t_node_info *node_info)
 {
@@ -2131,6 +2150,8 @@ set_node_active_status(PGconn *conn, int node_id, bool active)
 		active == true ? "TRUE" : "FALSE",
 		node_id
 		);
+
+	log_verbose(LOG_DEBUG, "set_node_active_status():\n%s\n", sqlquery);
 
 	res = PQexec(conn, sqlquery);
 	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)

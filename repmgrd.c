@@ -83,7 +83,6 @@ static int main_loop_bdr(FILE *fd);
 
 static void standby_monitor(void);
 static void witness_monitor(void);
-static void bdr_monitor(NodeInfoList *nodes);
 
 static bool check_connection(PGconn **conn, const char *type, const char *conninfo);
 static bool set_local_node_status(void);
@@ -92,8 +91,8 @@ static void update_shared_memory(char *last_wal_standby_applied);
 static void update_registration(PGconn *conn);
 static void do_master_failover(void);
 static bool do_upstream_standby_failover(t_node_info upstream_node);
-static void do_bdr_failover(NodeInfoList *nodes);
-
+static t_node_info *do_bdr_failover(NodeInfoList *nodes, t_node_info *monitored_node);
+static void load_node_records_by_priority(PGconn *conn, NodeInfoList *node_list);
 static t_node_info get_node_info(PGconn *conn, char *cluster, int node_id);
 static XLogRecPtr lsn_to_xlogrecptr(char *lsn, bool *format_ok);
 
@@ -630,12 +629,16 @@ main_loop_physical(FILE *fd)
 int
 main_loop_bdr(FILE *fd)
 {
-	bool        startup_event_logged = false;
-	NodeInfoList nodes = { NULL, NULL };
+	NodeInfoList  nodes = { NULL, NULL };
+	PGconn	     *monitoring_conn = NULL;
+	t_node_info  *monitored_node = NULL;
 
-	log_info(_("connecting to database '%s'\n"),
+	/* sanity check local database */
+
+	log_info(_("connecting to local database '%s'\n"),
 			 local_options.conninfo);
 	my_local_conn = establish_db_connection(local_options.conninfo, true);
+
 
 	/*
 	 * Verify that database is a BDR one
@@ -678,49 +681,146 @@ main_loop_bdr(FILE *fd)
 	// check if inactive node
 	// -> what to do?
 
+	/* Log startup event */
+
+	create_event_record(my_local_conn,
+						&local_options,
+						local_options.node,
+						"repmgrd_start",
+						true,
+						NULL);
+
+	/*
+	 * retrieve list of nodes - we'll need these if the DB connection goes away,
+	 * or if we're monitoring a non-local node
+	 */
+	load_node_records_by_priority(my_local_conn,
+								  &nodes);
+
+
+
+	/* decided which node to monitor */
+
+	if (local_options.bdr_monitoring_mode == BDR_MONITORING_LOCAL)
+	{
+		// if local, reuse my_local_conn?
+		monitored_node = get_node_record_pointer(my_local_conn, local_options.cluster_name, local_options.node);
+
+		monitoring_conn = establish_db_connection(monitored_node->conninfo_str, false);
+		log_debug("main_loop_bdr() monitoring local node %s %i\n", local_options.cluster_name, local_options.node);
+	}
+	else
+	{
+		NodeInfoListCell *cell;
+
+		for (cell = nodes.head; cell; cell = cell->next)
+		{
+			log_debug("main_loop_bdr() checking node %s %i\n", cell->node_info->name, cell->node_info->priority);
+
+			monitoring_conn = establish_db_connection(cell->node_info->conninfo_str, false);
+			if (PQstatus(monitoring_conn) == CONNECTION_OK)
+			{
+				log_debug("main_loop_bdr() monitoring node '%s' (ID %i, priority %i)\n",
+						  cell->node_info->name, cell->node_info->node_id, cell->node_info->priority);
+				/* fetch the record again, as the node list is transient */
+				monitored_node = get_node_record_pointer(monitoring_conn, local_options.cluster_name, cell->node_info->node_id);
+
+				break;
+			}
+		}
+	}
 
 	/*
 	 * MAIN LOOP
 	 */
 	for (;;)
 	{
-		if (reload_config(&local_options))
+		/* normal state - connection active */
+		if (PQstatus(monitoring_conn) == CONNECTION_OK)
 		{
-			PQfinish(my_local_conn);
-			my_local_conn = establish_db_connection(local_options.conninfo, true);
-			update_registration(my_local_conn);
+			log_info(_("starting continuous bdr node monitoring\n"));
+
+			/* monitoring loop */
+			do
+			{
+				log_verbose(LOG_DEBUG, "bdr check loop...\n");
+
+				{
+					NodeInfoListCell *cell;
+
+					for (cell = nodes.head; cell; cell = cell->next)
+					{
+						log_debug("bdr_monitor() %s\n", cell->node_info->name);
+					}
+				}
+
+				check_connection(&monitoring_conn, "bdr", monitored_node->conninfo_str);
+
+				if (PQstatus(monitoring_conn) != CONNECTION_OK)
+				{
+					t_node_info  *new_monitored_node;
+					log_warning("con problem!\n");
+					new_monitored_node = do_bdr_failover(&nodes, monitored_node);
+
+					if (new_monitored_node != NULL)
+					{
+						pfree(monitored_node);
+						monitored_node = new_monitored_node;
+					}
+					log_notice(_("monitored_node->name is now '%s' \n"), monitored_node->name);
+				}
+				else
+				{
+					sleep(local_options.monitor_interval_secs);
+				}
+
+				if (got_SIGHUP)
+				{
+					/*
+					 * if we can reload, then could need to change
+					 * my_local_conn
+					 */
+					if (reload_config(&local_options))
+					{
+						PQfinish(my_local_conn);
+						my_local_conn = establish_db_connection(local_options.conninfo, true);
+						update_registration(my_local_conn);
+					}
+
+					/* reload node list */
+					load_node_records_by_priority(my_local_conn,
+												  &nodes);
+
+					got_SIGHUP = false;
+				}
+
+			} while (!failover_done);
 		}
-
-		/* Log startup event */
-
-		if (startup_event_logged == false)
+		/* local connection inactive - periodically try and connect */
+		/* TODO: make this an option */
+		else
 		{
-			create_event_record(my_local_conn,
-								&local_options,
-								local_options.node,
-								"repmgrd_start",
-								true,
-								NULL);
-			startup_event_logged = true;
-		}
 
-		// get list of nodes
-		get_node_records_by_priority(my_local_conn,
-									 local_options.cluster_name,
-									 &nodes);
+			monitoring_conn = establish_db_connection(monitored_node->conninfo_str, false);
 
-		log_info(_("starting continuous bdr node monitoring\n"));
+			if (PQstatus(monitoring_conn) == CONNECTION_OK)
+			{
+				// XXX event bdr_node_recovered -> if monitored == local node
 
-		/* monitoring loop */
-		do
-		{
-			log_verbose(LOG_DEBUG, "bdr check loop...\n");
-			bdr_monitor(&nodes);
-
-			if (check_connection(&my_local_conn, "master", NULL))
+				if (monitored_node->node_id == local_options.node)
+				{
+					log_notice(_("local connection has returned, resuming monitoring\n"));
+				}
+				else
+				{
+					log_notice(_("connection to '%s' has returned, resuming monitoring\n"), monitored_node->name);
+				}
+			}
+			else
 			{
 				sleep(local_options.monitor_interval_secs);
 			}
+
 
 			if (got_SIGHUP)
 			{
@@ -730,23 +830,147 @@ main_loop_bdr(FILE *fd)
 				 */
 				if (reload_config(&local_options))
 				{
-					PQfinish(my_local_conn);
-					my_local_conn = establish_db_connection(local_options.conninfo, true);
-					update_registration(master_conn);
+					if (PQstatus(my_local_conn) == CONNECTION_OK)
+					{
+						PQfinish(my_local_conn);
+						my_local_conn = establish_db_connection(local_options.conninfo, true);
+						update_registration(my_local_conn);
+					}
 				}
 
-				// reload node list
+				/* reload node list */
+				if (PQstatus(my_local_conn) == CONNECTION_OK)
+					load_node_records_by_priority(my_local_conn,
+												  &nodes);
 
 				got_SIGHUP = false;
 			}
-
-		} while (!failover_done);
+		}
 
 		failover_done = false;
 	} /* End of main loop */
 
 	return 0;
 }
+
+
+/*
+ * do_bdr_failover()
+ *
+ * Here we attempt to perform a BDR "failover".
+ *
+ * As there's no equivalent of a physical replication failover,
+ * we'll do the following:
+ *
+ *  - attempt to find another node, to set our node record as inactive
+ *  - generate an event log record on that node
+ *  - optionally execute `bdr_failover_command`, passing the conninfo string
+ *    of that node to the command; this can be used for e.g. reconfiguring
+ *    pgbouncer.
+ *  - if mode is 'BDR_MONITORING_PRIORITY', redirect monitoring to that node.
+ *
+ */
+static t_node_info *
+do_bdr_failover(NodeInfoList *nodes, t_node_info *monitored_node)
+{
+	PGconn	   *next_node_conn = NULL;
+	NodeInfoListCell *cell;
+	bool	    failover_success = false;
+	PQExpBufferData event_details;
+	t_event_info event_info = T_EVENT_INFO_INITIALIZER;
+	t_node_info *new_monitored_node = NULL;
+
+	initPQExpBuffer(&event_details);
+
+	/* get next active priority node */
+
+	for (cell = nodes->head; cell; cell = cell->next)
+	{
+		log_debug("do_bdr_failover() %s\n", cell->node_info->name);
+
+		/* don't attempt to connect to the current monitored node, as that's the one which has failed  */
+		if (cell->node_info->node_id == monitored_node->node_id)
+			continue;
+
+		/* XXX skip inactive node? */
+
+		next_node_conn = establish_db_connection(cell->node_info->conninfo_str, false);
+
+		if (PQstatus(next_node_conn) == CONNECTION_OK)
+		{
+			// XXX check if record returned
+			new_monitored_node = get_node_record_pointer(next_node_conn, local_options.cluster_name, cell->node_info->node_id);
+
+			break;
+		}
+
+		next_node_conn = NULL;
+	}
+
+	if (next_node_conn == NULL)
+	{
+		appendPQExpBuffer(&event_details,
+						  _("no other available node found"));
+
+		log_err("%s\n", event_details.data);
+
+
+		// no other nodes found
+		// continue monitoring until node is restored?
+	}
+	else
+	{
+		log_info("connecting to target node %s\n", cell->node_info->name);
+
+		failover_success = true;
+
+		event_info.conninfo_str = cell->node_info->conninfo_str;
+		event_info.node_name = cell->node_info->name;
+
+		/* update our own record on the other node */
+		if (monitored_node->node_id == local_options.node)
+			set_node_active_status(next_node_conn, monitored_node->node_id, false);
+
+		if (local_options.bdr_monitoring_mode == BDR_MONITORING_PRIORITY)
+		{
+			log_notice("monitoring next available node by prioriy: %s (ID %i)\n", new_monitored_node->name, new_monitored_node->node_id);
+		}
+
+		appendPQExpBuffer(&event_details,
+						  _("node '%s' (ID: %i) detected as failed; next available node is '%s' (ID: %i)"),
+						  monitored_node->name,
+						  monitored_node->node_id,
+						  cell->node_info->name,
+						  cell->node_info->node_id);
+	}
+
+	/*
+	 * Create an event record
+	 *
+	 * If we were able to connect to another node, we'll update the
+	 * event log there.
+	 *
+	 * In any case the event notification command will be triggered
+	 * with the event "bdr_failover"
+	 */
+
+	create_event_record_extended(next_node_conn,
+								 &local_options,
+								 local_options.node,
+								 "bdr_failover",
+								 failover_success,
+								 event_details.data,
+								 &event_info);
+
+	failover_done = true;
+
+	if (local_options.bdr_monitoring_mode == BDR_MONITORING_PRIORITY)
+		return new_monitored_node;
+
+	/* local monitoring mode - there's no new node to monitor */
+	return NULL;
+}
+
 
 /*
  * witness_monitor()
@@ -1455,136 +1679,7 @@ standby_monitor(void)
 					PQerrorMessage(master_conn));
 }
 
-static void
-bdr_monitor(NodeInfoList *nodes)
-{
-	PGconn	   *monitoring_conn;
-	char		monitoring_conninfo[MAXCONNINFO];
 
-	// assume local connection
-
-	strncpy(monitoring_conninfo, local_options.conninfo,  MAXCONNINFO);
-
-	// if local, reuse my_local_con
-	monitoring_conn = establish_db_connection(monitoring_conninfo, false);
-
-	check_connection(&monitoring_conn, "bdr", monitoring_conninfo);
-
-	if (PQstatus(monitoring_conn) != CONNECTION_OK)
-	{
-		log_warning("con problem!\n");
-		do_bdr_failover(nodes);
-	}
-
-	{
-		NodeInfoListCell *cell;
-
-		for (cell = nodes->head; cell; cell = cell->next)
-		{
-			log_debug("xx %s\n", cell->node_info->name);
-		}
-	}
-
-}
-
-
-/*
- * do_bdr_failover()
- *
- * Here we attempt to perform a BDR "failover".
- *
- * As there's no equivalent of a physical replication failover,
- * we'll do the following:
- *
- *  - attempt to find another node to set our node record as inactive
- *  - generate an event log record on that node
- *  - optionally execute `bdr_failover_command`, paassing the conninfo string
- *    of that node to the command; this can be used for e.g. reconfiguring
- *    pgbouncer.
- *
- *
- */
-static void
-do_bdr_failover(NodeInfoList *nodes)
-{
-	PGconn	   *next_node_conn = NULL;
-	NodeInfoListCell *cell;
-	bool	    failover_success = false;
-	PQExpBufferData event_details;
-	t_event_info event_info = T_EVENT_INFO_INITIALIZER;
-
-	initPQExpBuffer(&event_details);
-
-	/* get next active priority node */
-
-	for (cell = nodes->head; cell; cell = cell->next)
-	{
-		log_debug("xx %s\n", cell->node_info->name);
-
-		/* don't attempt to connect to the local node  */
-		if (cell->node_info->node_id == local_options.node)
-			continue;
-
-		/* XXX skip inactive node? */
-
-		next_node_conn = establish_db_connection(cell->node_info->conninfo_str, false);
-
-		if (PQstatus(next_node_conn) == CONNECTION_OK)
-			break;
-
-		next_node_conn = NULL;
-	}
-
-	if (next_node_conn == NULL)
-	{
-		appendPQExpBuffer(&event_details,
-						  _("no other available node found"));
-
-		log_err("%s\n", event_details.data);
-
-
-		// no other nodes found
-		// continue monitoring until node is restored?
-	}
-	else
-	{
-		log_info("connecting to target node %s\n", cell->node_info->name);
-
-		failover_success = true;
-		event_info.conninfo_str = cell->node_info->conninfo_str;
-
-		/* update our own record on the other node */
-		set_node_active_status(next_node_conn, cell->node_info->node_id, false);
-
-		appendPQExpBuffer(&event_details,
-						  _("node '%s' (ID: %i) marked as failed; next available node is '%s' (ID: %i)"),
-						  local_options.node_name,
-						  local_options.node,
-						  cell->node_info->name,
-						  cell->node_info->node_id);
-	}
-
-	/*
-	 * Create an event record
-	 *
-	 * If we were able to connect to another node, we'll update the
-	 * event log there.
-	 *
-	 * In any case the event notification command will be triggered
-	 * with the event "bdr_failover"
-	 */
-	event_info.node_name = local_options.node_name;
-
-	create_event_record_extended(next_node_conn,
-								 &local_options,
-								 local_options.node,
-								 "bdr_failover",
-								 failover_success,
-								 event_details.data,
-								 &event_info);
-
-	terminate(ERR_FAILOVER_FAIL);
-}
 
 
 /*
@@ -2973,4 +3068,32 @@ get_node_info(PGconn *conn, char *cluster, int node_id)
 	}
 
 	return node_info;
+}
+
+
+void
+load_node_records_by_priority(PGconn *conn, NodeInfoList *nodes)
+{
+	NodeInfoListCell *cell;
+	NodeInfoListCell *next;
+
+	/* reset existing structure */
+
+	for (cell = nodes->head; cell; cell = next)
+	{
+		log_debug("lmrbp() %s\n", cell->node_info->name);
+
+		next = cell->next;
+
+		pfree(cell->node_info);
+		pfree(cell);
+	}
+
+	nodes->head = NULL;
+	nodes->tail = NULL;
+
+	get_node_records_by_priority(conn,
+								 local_options.cluster_name,
+								 nodes);
+
 }

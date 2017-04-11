@@ -63,6 +63,7 @@ typedef struct
 	int			replication_type;
 	int			failover;
 	int			priority;
+ 	int			bdr_monitoring_mode;
 	char		node_name[MAXLEN];
 	/* commands executed by repmgrd */
 	char		promote_command[MAXLEN];
@@ -98,7 +99,7 @@ typedef struct
  * The following will initialize the structure with a minimal set of options;
  * actual defaults are set in parse_config() before parsing the configuration file
  */
-#define T_CONFIGURATION_OPTIONS_INITIALIZER { "", UNKNOWN_NODE_ID, NO_UPSTREAM_NODE, "", "", "", REPLICATION_TYPE_PHYSICAL, MANUAL_FAILOVER, -1, "", "", "", "", "", "", "", "", "", "", "", "", -1, -1, -1, "", "", "", "", "", 0, 0, 0, 0, "", { NULL, NULL }, { NULL, NULL } }
+#define T_CONFIGURATION_OPTIONS_INITIALIZER { "", UNKNOWN_NODE_ID, NO_UPSTREAM_NODE, "", "", "", REPLICATION_TYPE_PHYSICAL, MANUAL_FAILOVER, -1, BDR_MONITORING_LOCAL, "", "", "", "", "", "", "", "", "", "", "", "", -1, -1, -1, "", "", "", "", "", 0, 0, 0, 0, "", { NULL, NULL }, { NULL, NULL } }
 
 typedef struct ItemListCell
 {

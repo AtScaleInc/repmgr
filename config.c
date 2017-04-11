@@ -420,6 +420,21 @@ _parse_config(t_configuration_options *options, ItemList *error_list)
 			strncpy(options->event_notification_command, value, MAXLEN);
 		else if (strcmp(name, "event_notifications") == 0)
 			parse_event_notifications_list(options, value);
+		else if (strcmp(name, "bdr_monitoring_mode") == 0)
+		{
+			if (strncmp(value, "local", MAXLEN) == 0)
+			{
+				options->bdr_monitoring_mode = BDR_MONITORING_LOCAL;
+			}
+			else if (strcmp(value, "highest_priority") == 0)
+			{
+				options->bdr_monitoring_mode = BDR_MONITORING_PRIORITY;
+			}
+			else
+			{
+				item_list_append(error_list, _("value for 'bdr_monitoring_mode' must be 'local' or 'highest_priority'\n"));
+			}
+		}
 		else if (strcmp(name, "tablespace_mapping") == 0)
 			tablespace_list_append(options, value);
 		else if (strcmp(name, "restore_command") == 0)

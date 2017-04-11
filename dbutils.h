@@ -156,6 +156,7 @@ bool		witness_copy_node_records(PGconn *masterconn, PGconn *witnessconn, char *c
 bool		create_node_record(PGconn *conn, char *action, int node, char *type, int upstream_node, char *cluster_name, char *node_name, char *conninfo, int priority, char *slot_name, bool active);
 bool		delete_node_record(PGconn *conn, int node, char *action);
 int			get_node_record(PGconn *conn, char *cluster, int node_id, t_node_info *node_info);
+t_node_info *get_node_record_pointer(PGconn *conn, char *cluster, int node_id);
 int			get_node_record_by_name(PGconn *conn, char *cluster, const char *node_name, t_node_info *node_info);
 void		get_node_records_by_priority(PGconn *conn, char *cluster, NodeInfoList *nodes);
 
