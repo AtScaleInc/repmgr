@@ -33,6 +33,7 @@ char repmgr_schema[MAXLEN] = "";
 char repmgr_schema_quoted[MAXLEN] = "";
 
 static int _get_node_record(PGconn *conn, char *cluster, char *sqlquery, t_node_info *node_info);
+static void _populate_node_record(PGresult *res, t_node_info *node_info, int row);
 static bool _set_config(PGconn *conn, const char *config_param, const char *sqlquery);
 
 /*
@@ -1514,9 +1515,30 @@ delete_node_record(PGconn *conn, int node, char *action)
  * user-defined notification to be generated; if not, this function will have
  * no effect.
  */
-
 bool
 create_event_record(PGconn *conn, t_configuration_options *options, int node_id, char *event, bool successful, char *details)
+{
+	t_event_info event_info = T_EVENT_INFO_INITIALIZER;
+
+	return _create_event_record(conn, options, node_id, event, successful, details, &event_info);
+}
+
+
+/*
+ * create_event_record_extended()
+ *
+ * The caller may need to pass additional parameters to the event notification
+ * command (currently only the conninfo string of another node)
+
+ */
+bool
+create_event_record_extended(PGconn *conn, t_configuration_options *options, int node_id, char *event, bool successful, char *details, t_event_info *event_info)
+{
+	return _create_event_record(conn, options, node_id, event, successful, details, event_info);
+}
+
+bool
+_create_event_record(PGconn *conn, t_configuration_options *options, int node_id, char *event, bool successful, char *details, t_event_info *event_info)
 {
 	char		sqlquery[QUERY_STR_LEN];
 	PGresult   *res;
@@ -1582,7 +1604,6 @@ create_event_record(PGconn *conn, t_configuration_options *options, int node_id,
 		{
 			/* Store timestamp to send to the notification command */
 			strncpy(event_timestamp, PQgetvalue(res, 0, 0), MAXLEN);
-			log_verbose(LOG_DEBUG, "create_event_record(): Event timestamp is \"%s\"\n", event_timestamp);
 		}
 
 		PQclear(res);
@@ -1601,6 +1622,8 @@ create_event_record(PGconn *conn, t_configuration_options *options, int node_id,
 		ts = *localtime(&now);
 		strftime(event_timestamp, MAXLEN, "%Y-%m-%d %H:%M:%S%z", &ts);
 	}
+
+	log_verbose(LOG_DEBUG, "create_event_record(): Event timestamp is \"%s\"\n", event_timestamp);
 
 	/* an event notification command was provided - parse and execute it */
 	if (strlen(options->event_notification_command))
@@ -1659,6 +1682,16 @@ create_event_record(PGconn *conn, t_configuration_options *options, int node_id,
 						snprintf(dst_ptr, end_ptr - dst_ptr, "%i", node_id);
 						dst_ptr += strlen(dst_ptr);
 						break;
+					case 'a':
+						/* %a: node name */
+						src_ptr++;
+						if (event_info->node_name != NULL)
+						{
+							log_debug("node_name: %s\n", event_info->node_name);
+							strlcpy(dst_ptr, event_info->node_name, end_ptr - dst_ptr);
+							dst_ptr += strlen(dst_ptr);
+						}
+						break;
 					case 'e':
 						/* %e: event type */
 						src_ptr++;
@@ -1681,10 +1714,21 @@ create_event_record(PGconn *conn, t_configuration_options *options, int node_id,
 						dst_ptr += strlen(dst_ptr);
 						break;
 					case 't':
-						/* %: timestamp */
+						/* %t: timestamp */
 						src_ptr++;
 						strlcpy(dst_ptr, event_timestamp, end_ptr - dst_ptr);
 						dst_ptr += strlen(dst_ptr);
+						break;
+					case 'c':
+						/* %c: conninfo for next available node */
+						src_ptr++;
+						if (event_info->conninfo_str != NULL)
+						{
+							log_debug("conninfo: %s\n", event_info->conninfo_str);
+
+							strlcpy(dst_ptr, event_info->conninfo_str, end_ptr - dst_ptr);
+							dst_ptr += strlen(dst_ptr);
+						}
 						break;
 					default:
 						/* otherwise treat the % as not special */
@@ -1889,8 +1933,7 @@ get_node_record(PGconn *conn, char *cluster, int node_id, t_node_info *node_info
 
 	sqlquery_snprintf(
 		sqlquery,
-		"SELECT id, type, upstream_node_id, name, conninfo, "
-		"       slot_name, priority, active"
+		"SELECT id, type, upstream_node_id, name, conninfo, slot_name, priority, active"
 		"  FROM %s.repl_nodes "
 		" WHERE cluster = '%s' "
 		"   AND id = %i",
@@ -1939,6 +1982,51 @@ get_node_record_by_name(PGconn *conn, char *cluster, const char *node_name, t_no
 }
 
 
+void
+get_node_records_by_priority(PGconn *conn, char *cluster, NodeInfoList *node_list)
+{
+	char		sqlquery[QUERY_STR_LEN];
+	PGresult *	res;
+	int			i;
+
+	sqlquery_snprintf(
+		sqlquery,
+		"  SELECT id, type, upstream_node_id, name, conninfo, slot_name, priority, active"
+		"   FROM %s.repl_nodes "
+		"   WHERE cluster = '%s' "
+		"ORDER BY priority DESC, name ",
+		get_repmgr_schema_quoted(conn),
+		cluster);
+
+	log_verbose(LOG_DEBUG, "get_node_records_by_priority():\n%s\n", sqlquery);
+
+	res = PQexec(conn, sqlquery);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		return;
+	}
+
+	for (i = 0; i < PQntuples(res); i++)
+	{
+		NodeInfoListCell *cell;
+		cell = (NodeInfoListCell *) pg_malloc0(sizeof(NodeInfoListCell));
+
+		cell->node_info = pg_malloc0(sizeof(t_node_info));
+
+		_populate_node_record(res, cell->node_info, i);
+
+		if (node_list->tail)
+			node_list->tail->next = cell;
+		else
+			node_list->head = cell;
+
+
+		node_list->tail = cell;
+	}
+
+	return;
+}
+
 static int
 _get_node_record(PGconn *conn, char *cluster, char *sqlquery, t_node_info *node_info)
 {
@@ -1957,30 +2045,40 @@ _get_node_record(PGconn *conn, char *cluster, char *sqlquery, t_node_info *node_
 	{
 		return 0;
 	}
+	_populate_node_record(res, node_info, 0);
 
-	node_info->node_id = atoi(PQgetvalue(res, 0, 0));
-	node_info->type = parse_node_type(PQgetvalue(res, 0, 1));
+	PQclear(res);
 
-	if (PQgetisnull(res, 0, 2))
+	return ntuples;
+}
+
+static void
+_populate_node_record(PGresult *res, t_node_info *node_info, int row)
+{
+	node_info->node_id = atoi(PQgetvalue(res, row, 0));
+	node_info->type = parse_node_type(PQgetvalue(res, row, 1));
+
+	if (PQgetisnull(res, row, 2))
 	{
 		node_info->upstream_node_id = NO_UPSTREAM_NODE;
 	}
 	else
 	{
-		node_info->upstream_node_id = atoi(PQgetvalue(res, 0, 2));
+		node_info->upstream_node_id = atoi(PQgetvalue(res, row, 2));
 	}
 
-	strncpy(node_info->name, PQgetvalue(res, 0, 3), MAXLEN);
-	strncpy(node_info->conninfo_str, PQgetvalue(res, 0, 4), MAXLEN);
-	strncpy(node_info->slot_name, PQgetvalue(res, 0, 5), MAXLEN);
-	node_info->priority = atoi(PQgetvalue(res, 0, 6));
-	node_info->active = (strcmp(PQgetvalue(res, 0, 7), "t") == 0)
+	strncpy(node_info->name, PQgetvalue(res, row, 3), MAXLEN);
+	strncpy(node_info->conninfo_str, PQgetvalue(res, row, 4), MAXLEN);
+	strncpy(node_info->slot_name, PQgetvalue(res, row, 5), MAXLEN);
+	node_info->priority = atoi(PQgetvalue(res, row, 6));
+	node_info->active = (strcmp(PQgetvalue(res, row, 7), "t") == 0)
 		? true
 		: false;
 
-	PQclear(res);
-
-	return ntuples;
+	/* Set remaining struct fields with default values */
+	node_info->is_ready = false;
+	node_info->is_visible = false;
+	node_info->xlog_location = InvalidXLogRecPtr;
 }
 
 
@@ -2017,6 +2115,35 @@ get_node_replication_state(PGconn *conn, char *node_name, char *output)
 
 	return true;
 
+}
+
+bool
+set_node_active_status(PGconn *conn, int node_id, bool active)
+{
+	char		sqlquery[QUERY_STR_LEN];
+	PGresult *	res;
+
+	sqlquery_snprintf(
+		sqlquery,
+		"UPDATE %s.repl_nodes SET active = %s "
+		" WHERE id = %i",
+		get_repmgr_schema_quoted(conn),
+		active == true ? "TRUE" : "FALSE",
+		node_id
+		);
+
+	res = PQexec(conn, sqlquery);
+	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		log_err(_("Unable to update node record\n%s\n"),
+				PQerrorMessage(conn));
+		PQclear(res);
+		return false;
+	}
+
+	PQclear(res);
+
+	return true;
 }
 
 
@@ -2119,4 +2246,37 @@ is_table_in_bdr_replication_set(PGconn *conn, char *tablename, char *set)
 	}
 
 	return atoi(PQgetvalue(res, 0, 0)) == 1 ? true : false;
+}
+
+
+
+bool
+add_table_to_bdr_replication_set(PGconn *conn, char *tablename, char *set)
+{
+	char		sqlquery[QUERY_STR_LEN];
+	PGresult *	res;
+
+	sqlquery_snprintf(sqlquery,
+					  "SELECT bdr.table_set_replication_sets('%s.%s', '{%s}')",
+					  get_repmgr_schema_quoted(conn),
+					  tablename,
+					  set);
+
+	res = PQexec(conn, sqlquery);
+	if (!res || PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		log_err(_("unable to add table '%s.%s' to replication set '%s': %s\n"),
+				get_repmgr_schema_quoted(conn),
+				tablename,
+				set,
+				PQerrorMessage(conn));
+
+		if (res != NULL)
+			PQclear(res);
+
+		return false;
+	}
+	PQclear(res);
+
+	return true;
 }

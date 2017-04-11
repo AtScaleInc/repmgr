@@ -6619,7 +6619,7 @@ do_bdr_register(void)
 		exit(ERR_BAD_CONFIG);
 	}
 
-	// check if repmgr schema exists, and that any other nodes are BDR
+	/* check if repmgr schema exists, and that any other nodes are BDR */
 	repmgr_schema_exists = check_cluster_schema(conn);
 
 	if (repmgr_schema_exists == true)
@@ -6752,7 +6752,7 @@ do_bdr_register(void)
 										   true);
 		if (node_recorded == true)
 		{
-			appendPQExpBuffer(&event_details,_("node record created for node %i ('%s') \n"), options.node, options.node_name);
+			appendPQExpBuffer(&event_details,_("node record created for node '%s'(ID: %i)"), options.node_name, options.node);
 			log_verbose(LOG_NOTICE, "%s\n", event_details.data);
 		}
 
@@ -7813,22 +7813,8 @@ create_schema(PGconn *conn)
 	/* For BDR replication, add table to 'repmgr' replication set */
 	if (options.replication_type == REPLICATION_TYPE_BDR)
 	{
-		sqlquery_snprintf(sqlquery,
-						  "SELECT bdr.table_set_replication_sets('%s.repl_nodes', '{repmgr}')",
-						  get_repmgr_schema_quoted(conn));
-
-		res = PQexec(conn, sqlquery);
-		if (!res || PQresultStatus(res) != PGRES_TUPLES_OK)
-		{
-			log_err(_("unable to add table '%s.repl_nodes' to replication set 'repmgr': %s\n"),
-					get_repmgr_schema_quoted(conn), PQerrorMessage(conn));
-
-			if (res != NULL)
-				PQclear(res);
-
+		if (add_table_to_bdr_replication_set(conn, "repl_nodes", "repmgr") == false)
 			return false;
-		}
-		PQclear(res);
 	}
 
 	/* CREATE TRIGGER repmgr_repl_nodes_type_check_trg */
@@ -7917,6 +7903,13 @@ create_schema(PGconn *conn)
 	}
 	PQclear(res);
 
+	/* For BDR replication, add table to 'repmgr' replication set */
+	if (options.replication_type == REPLICATION_TYPE_BDR)
+	{
+		if (add_table_to_bdr_replication_set(conn, "repl_events", "repmgr") == false)
+			return false;
+	}
+
 	if (options.replication_type != REPLICATION_TYPE_BDR)
 	{
 		/* CREATE VIEW repl_status  */
@@ -7987,9 +7980,9 @@ create_schema(PGconn *conn)
 			                  "  FROM %s.repl_nodes as rn"
 			                  "  LEFT JOIN %s.repl_nodes AS sq"
 			                  "    ON sq.id=rn.upstream_node_id",
-			  get_repmgr_schema_quoted(conn),
-			  get_repmgr_schema_quoted(conn),
-			  get_repmgr_schema_quoted(conn));
+					  get_repmgr_schema_quoted(conn),
+					  get_repmgr_schema_quoted(conn),
+					  get_repmgr_schema_quoted(conn));
 
 	wrap_query(sqlquery);
 

@@ -55,6 +55,25 @@ typedef struct s_node_info
 }	t_node_info;
 
 
+typedef struct NodeInfoListCell
+{
+	struct NodeInfoListCell *next;
+	t_node_info *node_info;
+} NodeInfoListCell;
+
+typedef struct NodeInfoList
+{
+	NodeInfoListCell *head;
+	NodeInfoListCell *tail;
+} NodeInfoList;
+
+
+typedef struct s_event_info
+{
+	char		  *node_name;
+	char		  *conninfo_str;
+}   t_event_info;
+
 #define T_NODE_INFO_INITIALIZER { \
   NODE_NOT_FOUND, \
   NO_UPSTREAM_NODE, \
@@ -67,6 +86,11 @@ typedef struct s_node_info
   false, \
   false, \
   InvalidXLogRecPtr \
+}
+
+#define T_EVENT_INFO_INITIALIZER { \
+  NULL, \
+  NULL \
 }
 
 /*
@@ -97,8 +121,7 @@ bool		begin_transaction(PGconn *conn);
 bool		commit_transaction(PGconn *conn);
 bool		rollback_transaction(PGconn *conn);
 bool		check_cluster_schema(PGconn *conn);
-bool		is_bdr_database(PGconn *conn);
-bool		is_table_in_bdr_replication_set(PGconn *conn, char *tablename, char *set);
+
 int			is_standby(PGconn *conn);
 bool		is_pgup(PGconn *conn, int timeout);
 int			get_master_node_id(PGconn *conn, char *cluster);
@@ -134,14 +157,23 @@ bool		create_node_record(PGconn *conn, char *action, int node, char *type, int u
 bool		delete_node_record(PGconn *conn, int node, char *action);
 int			get_node_record(PGconn *conn, char *cluster, int node_id, t_node_info *node_info);
 int			get_node_record_by_name(PGconn *conn, char *cluster, const char *node_name, t_node_info *node_info);
+void		get_node_records_by_priority(PGconn *conn, char *cluster, NodeInfoList *nodes);
+
 bool        update_node_record(PGconn *conn, char *action, int node, char *type, int upstream_node, char *cluster_name, char *node_name, char *conninfo, int priority, char *slot_name, bool active);
 bool        update_node_record_status(PGconn *conn, char *cluster_name, int this_node_id, char *type, int upstream_node_id, bool active);
 bool        update_node_record_set_upstream(PGconn *conn, char *cluster_name, int this_node_id, int new_upstream_node_id);
 bool        create_event_record(PGconn *conn, t_configuration_options *options, int node_id, char *event, bool successful, char *details);
+bool        create_event_record_extended(PGconn *conn, t_configuration_options *options, int node_id, char *event, bool successful, char *details, t_event_info *event_info);
+bool		_create_event_record(PGconn *conn, t_configuration_options *options, int node_id, char *event, bool successful, char *details, t_event_info *event_info);
 
 int		    get_node_replication_state(PGconn *conn, char *node_name, char *output);
 t_server_type parse_node_type(const char *type);
 int			get_data_checksum_version(const char *data_directory);
+
+bool		set_node_active_status(PGconn *conn, int node_id, bool status);
+
 bool		is_bdr_db(PGconn *conn);
+bool		is_table_in_bdr_replication_set(PGconn *conn, char *tablename, char *set);
+bool		add_table_to_bdr_replication_set(PGconn *conn, char *tablename, char *set);
 #endif
 

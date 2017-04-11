@@ -1414,18 +1414,25 @@ or script which can take further action, e.g. send email notifications.
 This is done by setting the `event_notification_command` parameter in
 `repmgr.conf`.
 
-This parameter accepts the following format placeholders:
+This parameter accepts the following standard format placeholders:
 
-     %n - node ID
-     %e - event type
-     %s - success (1 or 0)
-     %t - timestamp
-     %d - details
+    %n - node ID
+    %e - event type
+    %s - success (1 or 0)
+    %t - timestamp
+    %d - details
 
 The values provided for "%t" and "%d" will probably contain spaces,
 so should be quoted in the provided command configuration, e.g.:
 
     event_notification_command='/path/to/some/script %n %e %s "%t" "%d"'
+
+Additionally the following format is available for the event type
+`bdr_failover`:
+
+    %c - conninfo string of the next available node
+
+This should always be quoted.
 
 By default, all notifications will be passed; the notification types
 can be filtered to explicitly named ones:
@@ -1449,6 +1456,7 @@ The following event types are available:
   * `repmgrd_shutdown`
   * `repmgrd_failover_promote`
   * `repmgrd_failover_follow`
+  * `bdr_failover`
 
 Note that under some circumstances (e.g. no replication cluster master could
 be located), it will not be possible to write an entry into the `repl_events`
