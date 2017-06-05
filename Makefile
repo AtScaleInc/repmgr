@@ -8,8 +8,9 @@ repmgrd_OBJS = dbutils.o config.o repmgrd.o log.o strutil.o
 repmgr_OBJS = dbutils.o check_dir.o config.o repmgr.o log.o strutil.o dirmod.o compat.o
 
 DATA = repmgr.sql uninstall_repmgr.sql
+REGRESS = repmgr_funcs repmgr_test
 
-PG_CPPFLAGS = -I$(libpq_srcdir)
+PG_CPPFLAGS = -I$(includedir_internal) -I$(libpq_srcdir)
 PG_LIBS     = $(libpq_pgport)
 
 
@@ -17,11 +18,11 @@ all: repmgrd repmgr
 	$(MAKE) -C sql
 
 repmgrd: $(repmgrd_OBJS)
-	$(CC) -o repmgrd $(CFLAGS) $(repmgrd_OBJS) $(PG_LIBS) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS)
+	$(CC) -o repmgrd $(CFLAGS) $(repmgrd_OBJS) $(PG_LIBS) $(LDFLAGS) $(LDFLAGS_EX)
 	$(MAKE) -C sql
 
 repmgr: $(repmgr_OBJS)
-	$(CC) -o repmgr $(CFLAGS) $(repmgr_OBJS) $(PG_LIBS) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS)
+	$(CC) -o repmgr $(CFLAGS) $(repmgr_OBJS) $(PG_LIBS) $(LDFLAGS) $(LDFLAGS_EX)
 
 # Make all objects depend on all include files. This is a bit of a
 # shotgun approach, but the codebase is small enough that a complete rebuild

@@ -168,6 +168,8 @@ static void param_set(t_conninfo_param_list *param_list, const char *param, cons
 static char *param_get(t_conninfo_param_list *param_list, const char *param);
 static bool parse_conninfo_string(const char *conninfo_str, t_conninfo_param_list *param_list, char *errmsg, bool ignore_application_name);
 static void conn_to_param_list(PGconn *conn, t_conninfo_param_list *param_list);
+static char *param_list_to_string(t_conninfo_param_list *param_list);
+
 static bool parse_pg_basebackup_options(const char *pg_basebackup_options, t_basebackup_options *backup_options, int server_version_num, ItemList *error_list);
 
 static void config_file_list_init(t_configfile_list *list, int max_size);
@@ -230,14 +232,14 @@ main(int argc, char **argv)
 		{"rsync-only", no_argument, NULL, 'r'},
 		{"fast-checkpoint", no_argument, NULL, 'c'},
 		{"log-level", required_argument, NULL, 'L'},
-		{"terse", required_argument, NULL, 't'},
+		{"terse", no_argument, NULL, 't'},
 		{"mode", required_argument, NULL, 'm'},
+		{"pwprompt", no_argument, NULL, 'P'},
 		{"remote-config-file", required_argument, NULL, 'C'},
 		{"help", no_argument, NULL, OPT_HELP},
 		{"check-upstream-config", no_argument, NULL, OPT_CHECK_UPSTREAM_CONFIG},
 		{"recovery-min-apply-delay", required_argument, NULL, OPT_RECOVERY_MIN_APPLY_DELAY},
 		{"pg_rewind", optional_argument, NULL, OPT_PG_REWIND},
-		{"pwprompt", optional_argument, NULL, OPT_PWPROMPT},
 		{"csv", no_argument, NULL, OPT_CSV},
 		{"node", required_argument, NULL, OPT_NODE},
 		{"without-barman", no_argument, NULL, OPT_WITHOUT_BARMAN},
@@ -348,7 +350,7 @@ main(int argc, char **argv)
 		strncpy(runtime_options.dbname, runtime_options.username, MAXLEN);
 	}
 
-	while ((c = getopt_long(argc, argv, "?Vd:h:p:U:S:D:f:R:w:k:FWIvb:rcL:tm:C:l:", long_options,
+	while ((c = getopt_long(argc, argv, "?Vd:h:p:U:S:D:f:R:w:k:FWIvb:rcL:tm:C:l:P", long_options,
 							&optindex)) != -1)
 	{
 		/*
@@ -474,6 +476,9 @@ main(int argc, char **argv)
 			case 'C':
 				strncpy(runtime_options.remote_config_file, optarg, MAXLEN);
 				break;
+			case 'P':
+				runtime_options.witness_pwprompt = true;
+				break;
 			case OPT_CHECK_UPSTREAM_CONFIG:
 				check_upstream_config = true;
 				break;
@@ -523,9 +528,6 @@ main(int argc, char **argv)
 					strncpy(runtime_options.pg_rewind, optarg, MAXPGPATH);
 				}
 				runtime_options.pg_rewind_supplied = true;
-				break;
-			case OPT_PWPROMPT:
-				runtime_options.witness_pwprompt = true;
 				break;
 			case OPT_CSV:
 				runtime_options.csv_mode = true;
@@ -895,7 +897,6 @@ main(int argc, char **argv)
 
 	if (runtime_options.terse)
 		logger_set_terse();
-
 
 	/*
 	 * Node configuration information is not needed for all actions, with
@@ -1926,7 +1927,7 @@ do_master_register(void)
 
 	if (!schema_exists)
 	{
-		log_info(_("master register: creating database objects inside the %s schema\n"),
+		log_info(_("master register: creating database objects inside the '%s' schema\n"),
 				 get_repmgr_schema());
 
 		begin_transaction(conn);
@@ -1972,8 +1973,6 @@ do_master_register(void)
 		PQfinish(conn);
 		exit(ERR_BAD_CONFIG);
 	}
-
-	begin_transaction(conn);
 
 	/*
 	 * Check whether there's an existing record for this node, and
@@ -2038,7 +2037,7 @@ do_master_register(void)
 
 	PQfinish(conn);
 
-	log_notice(_("master node correctly registered for cluster %s with id %d (conninfo: %s)\n"),
+	log_notice(_("master node correctly registered for cluster '%s' with id %d (conninfo: %s)\n"),
 			   options.cluster_name, options.node, options.conninfo);
 	return;
 }
@@ -2179,7 +2178,7 @@ do_standby_register(void)
 				log_err(_("no record found for upstream node %i\n"),
 						options.upstream_node);
 				/* footgun alert - only do this if you know what you're doing */
-				log_hint(_("use option -F/--force to create a dummy upstream record"));
+				log_hint(_("use option -F/--force to create a dummy upstream record\n"));
 				PQfinish(master_conn);
 				if (PQstatus(conn) == CONNECTION_OK)
 					PQfinish(conn);
@@ -4795,7 +4794,7 @@ do_standby_follow(void)
 	 * (a former standby) exists on the former upstream, drop it.
 	 */
 
-	if (options.use_replication_slots && original_upstream_node_id != UNKNOWN_NODE_ID)
+	if (options.use_replication_slots && runtime_options.host_param_provided == false && original_upstream_node_id != UNKNOWN_NODE_ID)
 	{
 		t_node_info upstream_node_record  = T_NODE_INFO_INITIALIZER;
 		int			upstream_query_result;
@@ -5099,7 +5098,11 @@ do_standby_switchover(void)
 
 		initPQExpBuffer(&remote_command_str);
 
-		appendPQExpBuffer(&remote_command_str, "ls ");
+		if (strcmp(remote_pg_rewind, "pg_rewind") == 0)
+			appendPQExpBuffer(&remote_command_str, "which ");
+		else
+			appendPQExpBuffer(&remote_command_str, "ls ");
+
 		appendShellString(&remote_command_str, remote_pg_rewind);
 		appendPQExpBuffer(&remote_command_str, " >/dev/null 2>&1 && echo 1 || echo 0");
 
@@ -5116,7 +5119,11 @@ do_standby_switchover(void)
 		if (*command_output.data == '0')
 		{
 			log_err(_("unable to find pg_rewind on the remote server\n"));
-			log_err(_("expected location is: %s\n"), remote_pg_rewind);
+			if (strcmp(remote_pg_rewind, "pg_rewind") == 0)
+				log_hint(_("set pg_bindir in repmgr.conf or provide with -b/--pg_bindir\n"));
+			else
+				log_detail(_("expected location is: %s\n"), remote_pg_rewind);
+
 			exit(ERR_BAD_CONFIG);
 		}
 
@@ -5296,7 +5303,7 @@ do_standby_switchover(void)
 		appendPQExpBuffer(&remote_command_str,
 						  "%s standby archive-config -f ",
 						  make_pg_path("repmgr"));
-		appendShellString(&remote_command_str,	runtime_options.remote_config_file);
+		appendShellString(&remote_command_str, runtime_options.remote_config_file);
 		appendPQExpBuffer(&remote_command_str,
 						  " --config-archive-dir=");
 		appendShellString(&remote_command_str, remote_archive_config_dir);
@@ -5470,12 +5477,22 @@ do_standby_switchover(void)
 		/* Restore any previously archived config files */
 		initPQExpBuffer(&remote_command_str);
 
+		/* --force */
 		appendPQExpBuffer(&remote_command_str,
 						  "%s standby restore-config -D ",
 						  make_pg_path("repmgr"));
 		appendShellString(&remote_command_str, remote_data_directory);
+
+		/*
+		 * append pass the configuration file to prevent spurious errors
+		 * about missing cluster_name
+		 */
 		appendPQExpBuffer(&remote_command_str,
-						  "  --config-archive-dir=");
+						  " -f ");
+		appendShellString(&remote_command_str, runtime_options.remote_config_file);
+
+		appendPQExpBuffer(&remote_command_str,
+						  " --config-archive-dir=");
 		appendShellString(&remote_command_str, remote_archive_config_dir);
 
 		initPQExpBuffer(&command_output);
@@ -5929,11 +5946,13 @@ do_standby_restore_config(void)
 
 	if (rmdir(runtime_options.config_archive_dir) != 0 && errno != EEXIST)
 	{
-		log_err(_("Unable to delete %s\n"), runtime_options.config_archive_dir);
-		exit(ERR_BAD_CONFIG);
+		log_warning(_("unable to delete %s\n"), runtime_options.config_archive_dir);
+		log_detail(_("directory may need to be manually removed\n"));
 	}
-
-	log_verbose(LOG_NOTICE, "Directory %s deleted\n", runtime_options.config_archive_dir);
+	else
+	{
+		log_verbose(LOG_NOTICE, "directory %s deleted\n", runtime_options.config_archive_dir);
+	}
 
 	return;
 }
@@ -7339,7 +7358,22 @@ run_basebackup(const char *data_dir, int server_version_num)
 	 */
 	if (runtime_options.conninfo_provided == true)
 	{
-		appendPQExpBuffer(&params, " -d '%s'", runtime_options.dbname);
+		t_conninfo_param_list conninfo;
+		char *conninfo_str;
+
+		initialize_conninfo_params(&conninfo, false);
+
+		/* string will already have been parsed */
+		(void) parse_conninfo_string(runtime_options.dbname, &conninfo, NULL, false);
+
+		if (*runtime_options.replication_user)
+			param_set(&conninfo, "user", runtime_options.replication_user);
+
+		conninfo_str = param_list_to_string(&conninfo);
+
+		appendPQExpBuffer(&params, " -d '%s'", conninfo_str);
+
+		pfree(conninfo_str);
 	}
 
 	/*
@@ -9170,6 +9204,43 @@ conn_to_param_list(PGconn *conn, t_conninfo_param_list *param_list)
 		param_set(param_list, option->keyword, option->val);
 	}
 }
+
+
+static char *
+param_list_to_string(t_conninfo_param_list *param_list)
+{
+	int c;
+	PQExpBufferData conninfo_buf;
+	char *conninfo_str;
+	int len;
+
+	initPQExpBuffer(&conninfo_buf);
+
+	for (c = 0; c < param_list->size && param_list->keywords[c] != NULL; c++)
+	{
+		if (param_list->values[c] != NULL && param_list->values[c][0] != '\0')
+		{
+			if (c > 0)
+				appendPQExpBufferChar(&conninfo_buf, ' ');
+
+			appendPQExpBuffer(&conninfo_buf,
+							  "%s=%s",
+							  param_list->keywords[c],
+							  param_list->values[c]);
+		}
+	}
+
+	len = strlen(conninfo_buf.data) + 1;
+	conninfo_str = pg_malloc0(len);
+
+	strncpy(conninfo_str, conninfo_buf.data, len);
+
+	termPQExpBuffer(&conninfo_buf);
+
+	return conninfo_str;
+}
+
+
 
 
 static bool

@@ -504,7 +504,7 @@ place. To ensure this happens when using the default `pg_basebackup` method,
 which will ensure all WAL files generated during the cloning process are
 streamed in parallel with the main backup. Note that this requires two
 replication connections to be available (`repmgr` will verify sufficient
-connections are available before attempting to clonse).
+connections are available before attempting to clone).
 
 To override this behaviour, in `repmgr.conf` set `pg_basebackup`'s
 `--xlog-method` parameter to `fetch`:
@@ -1072,8 +1072,9 @@ should have been updated to reflect this:
    data checksums were enabled when the cluster was initialized. See the
   `pg_rewind` documentation for details:
      https://www.postgresql.org/docs/current/static/app-pgrewind.html
-- `repmgrd` should not be running when a switchover is carried out, otherwise
-  the `repmgrd` may try and promote a standby by itself.
+- `repmgrd` should not be running with setting `failover=automatic` in
+  `repmgr.conf` when a switchover is carried out, otherwise the `repmgrd`
+  may try and promote a standby by itself.
 - Any other standbys attached to the old master will need to be manually
   instructed to point to the new master (e.g. with `repmgr standby follow`).
 - You must ensure that following a server start using `pg_ctl`, log output

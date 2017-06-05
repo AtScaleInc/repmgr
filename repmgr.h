@@ -62,7 +62,6 @@
 #define OPT_COPY_EXTERNAL_CONFIG_FILES   4
 #define OPT_CONFIG_ARCHIVE_DIR           5
 #define OPT_PG_REWIND                    6
-#define OPT_PWPROMPT                     7
 #define OPT_CSV                          8
 #define OPT_NODE                         9
 #define OPT_WITHOUT_BARMAN               10
@@ -125,7 +124,7 @@ typedef struct
 
 	char		recovery_min_apply_delay[MAXLEN];
 
-	/* standby register paarameters */
+	/* standby register parameters */
 	bool		wait_register_sync;
 	int			wait_register_sync_seconds;
 

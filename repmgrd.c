@@ -30,17 +30,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-
-
 #include "repmgr.h"
-#include "config.h"
 #include "log.h"
-#include "strutil.h"
 #include "version.h"
-
-/* Required PostgreSQL headers */
-#include "access/xlogdefs.h"
-#include "pqexpbuffer.h"
 
 /* Message strings passed in repmgrSharedState->location */
 
@@ -1092,7 +1084,7 @@ witness_monitor(void)
 		return;
 	}
 
-	strcpy(monitor_witness_timestamp, PQgetvalue(res, 0, 0));
+	strncpy(monitor_witness_timestamp, PQgetvalue(res, 0, 0), MAXLEN);
 	PQclear(res);
 
 	/*
@@ -1108,7 +1100,7 @@ witness_monitor(void)
 						  "            replication_lag, apply_lag )"
 						  "      VALUES(%d, %d, "
 						  "             '%s'::TIMESTAMP WITH TIME ZONE, NULL, "
-						  "             pg_catalog.pg_current_wal_location(), NULL, "
+						  "             pg_catalog.pg_current_wal_lsn(), NULL, "
 						  "             0, 0) ",
 						  get_repmgr_schema_quoted(my_local_conn),
 						  master_options.node,
@@ -1532,8 +1524,8 @@ standby_monitor(void)
 						  "        replay_timestamp, "
 						  "        COALESCE(receive_location, '0/0') >= replay_location AS receiving_streamed_wal "
 						  "   FROM (SELECT CURRENT_TIMESTAMP AS ts, "
-						  "         pg_catalog.pg_last_wal_receive_location()  AS receive_location, "
-						  "         pg_catalog.pg_last_wal_replay_location()   AS replay_location, "
+						  "         pg_catalog.pg_last_wal_receive_lsn()  AS receive_location, "
+						  "         pg_catalog.pg_last_wal_replay_lsn()   AS replay_location, "
 						  "         pg_catalog.pg_last_xact_replay_timestamp() AS replay_timestamp "
 						  "        ) q ");
 
@@ -1566,9 +1558,9 @@ standby_monitor(void)
 		return;
 	}
 
-	strncpy(monitor_standby_timestamp, PQgetvalue(res, 0, 0), MAXLEN);
+	strncpy(monitor_standby_timestamp,  PQgetvalue(res, 0, 0), MAXLEN);
 	strncpy(last_xlog_receive_location, PQgetvalue(res, 0, 1), MAXLEN);
-	strncpy(last_xlog_replay_location, PQgetvalue(res, 0, 2), MAXLEN);
+	strncpy(last_xlog_replay_location,  PQgetvalue(res, 0, 2), MAXLEN);
 	strncpy(last_xact_replay_timestamp, PQgetvalue(res, 0, 3), MAXLEN);
 
 	receiving_streamed_wal = (strcmp(PQgetvalue(res, 0, 4), "t") == 0)
@@ -1590,7 +1582,7 @@ standby_monitor(void)
 	 */
 
 	if (server_version_num >= 100000)
-		sqlquery_snprintf(sqlquery, "SELECT pg_catalog.pg_current_wal_location()");
+		sqlquery_snprintf(sqlquery, "SELECT pg_catalog.pg_current_wal_lsn()");
 	else
 		sqlquery_snprintf(sqlquery, "SELECT pg_catalog.pg_current_xlog_location()");
 
@@ -1675,8 +1667,23 @@ standby_monitor(void)
 	log_verbose(LOG_DEBUG, "standby_monitor:() %s\n", sqlquery);
 
 	if (PQsendQuery(master_conn, sqlquery) == 0)
-		log_warning(_("query could not be sent to master. %s\n"),
+	{
+		log_warning(_("query could not be sent to master: %s\n"),
 					PQerrorMessage(master_conn));
+	}
+	else
+	{
+		sqlquery_snprintf(sqlquery,
+						  "SELECT %s.repmgr_update_last_updated();",
+						  get_repmgr_schema_quoted(my_local_conn));
+		res = PQexec(my_local_conn, sqlquery);
+
+		/* not critical if the above query fails*/
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+			log_warning(_("unable to set last_updated: %s\n"), PQerrorMessage(my_local_conn));
+
+		PQclear(res);
+	}
 }
 
 
@@ -1870,7 +1877,11 @@ do_master_failover(void)
 			terminate(ERR_FAILOVER_FAIL);
 		}
 
-		sqlquery_snprintf(sqlquery, "SELECT pg_catalog.pg_last_xlog_receive_location()");
+		if (server_version_num >= 100000)
+			sqlquery_snprintf(sqlquery, "SELECT pg_catalog.pg_last_wal_receive_lsn()");
+		else
+			sqlquery_snprintf(sqlquery, "SELECT pg_catalog.pg_last_xlog_receive_location()");
+
 		res = PQexec(node_conn, sqlquery);
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		{
@@ -1902,7 +1913,12 @@ do_master_failover(void)
 	}
 
 	/* last we get info about this node, and update shared memory */
-	sprintf(sqlquery, "SELECT pg_catalog.pg_last_xlog_receive_location()");
+
+	if (server_version_num >= 100000)
+		sprintf(sqlquery, "SELECT pg_catalog.pg_last_wal_receive_lsn()");
+	else
+		sprintf(sqlquery, "SELECT pg_catalog.pg_last_xlog_receive_location()");
+
 	res = PQexec(my_local_conn, sqlquery);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
