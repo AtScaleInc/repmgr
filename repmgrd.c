@@ -621,7 +621,7 @@ main_loop_physical(FILE *fd)
 int
 main_loop_bdr(FILE *fd)
 {
-	NodeInfoList  nodes = { NULL, NULL };
+	NodeInfoList  nodes = T_NODE_INFO_LIST_INITIALIZER;
 	PGconn	     *monitoring_conn = NULL;
 	t_node_info  *monitored_node = NULL;
 

@@ -67,6 +67,11 @@ typedef struct NodeInfoList
 	NodeInfoListCell *tail;
 } NodeInfoList;
 
+#define T_NODE_INFO_LIST_INITIALIZER { \
+	NULL, \
+	NULL \
+}
+
 
 typedef struct s_event_info
 {
