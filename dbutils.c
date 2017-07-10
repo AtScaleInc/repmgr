@@ -2225,7 +2225,8 @@ bool
 is_bdr_db(PGconn *conn)
 {
 	char		sqlquery[QUERY_STR_LEN];
-	PGresult *	res;
+	PGresult   *res;
+	bool		is_bdr_db;
 
 	sqlquery_snprintf(
 		sqlquery,
@@ -2234,14 +2235,21 @@ is_bdr_db(PGconn *conn)
 
 	res = PQexec(conn, sqlquery);
 
+
 	if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0)
 	{
-		PQclear(res);
-		return false;
+		is_bdr_db = false;
+	}
+	else
+	{
+		is_bdr_db = atoi(PQgetvalue(res, 0, 0)) == 1 ? true : false;
 	}
 
-	return atoi(PQgetvalue(res, 0, 0)) == 1 ? true : false;
+	PQclear(res);
+
+	return is_bdr_db;
 }
+
 
 bool
 is_bdr_repmgr(PGconn *conn)
@@ -2256,9 +2264,18 @@ is_bdr_repmgr(PGconn *conn)
 					  " WHERE type != 'bdr' ",
 					  get_repmgr_schema_quoted(conn));
 
-	// XXX check result
+
 	res = PQexec(conn, sqlquery);
+
+	if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0)
+	{
+		PQclear(res);
+		return false;
+	}
+
 	non_bdr_nodes = atoi(PQgetvalue(res, 0, 0));
+
+	PQclear(res);
 
 	return (non_bdr_nodes == 0) ? true : false;
 }
@@ -2268,7 +2285,8 @@ bool
 is_table_in_bdr_replication_set(PGconn *conn, char *tablename, char *set)
 {
 	char		sqlquery[QUERY_STR_LEN];
-	PGresult *	res;
+	PGresult   *res;
+	bool		in_replication_set;
 
 	sqlquery_snprintf(
 		sqlquery,
@@ -2277,17 +2295,22 @@ is_table_in_bdr_replication_set(PGconn *conn, char *tablename, char *set)
 		" WHERE repset='%s' ",
 		get_repmgr_schema_quoted(conn),
 		tablename,
-		tablename
-		);
+		set);
+
 	res = PQexec(conn, sqlquery);
 
 	if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0)
 	{
-		PQclear(res);
-		return false;
+		in_replication_set = false;
+	}
+	else
+	{
+		in_replication_set = atoi(PQgetvalue(res, 0, 0)) == 1 ? true : false;
 	}
 
-	return atoi(PQgetvalue(res, 0, 0)) == 1 ? true : false;
+	PQclear(res);
+
+	return in_replication_set;
 }
 
 
